@@ -26,18 +26,25 @@ pub fn collect() -> Section {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
-    use std::process::Command;
+    use crate::telemetry::collectors::winps;
 
     /// Parse `winget upgrade` into `{id, name, version, available}` rows; `warn`
     /// when upgrades are pending.
     pub fn collect() -> Section {
-        let output = Command::new("winget")
-            .args(["upgrade", "--include-unknown", "--accept-source-agreements"])
-            .output();
-
-        let raw = match output {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => {
+        // Through `winps::run_command` rather than a bare `Command`: it is
+        // success-gated the same way, and it holds every probe to
+        // `winps::PROBE_BUDGET`. `winget` is the slowest and least predictable
+        // program any collector shells out to — it refreshes its sources over the
+        // network and can sit there indefinitely on a host with no usable source —
+        // and an unbounded probe here would pin one collector-pool worker for as
+        // long as it takes, which is the one thing the pool's budget exists to
+        // prevent. A killed probe reads as "unavailable", like any other failure.
+        let raw = match winps::run_command(
+            "winget",
+            &["upgrade", "--include-unknown", "--accept-source-agreements"],
+        ) {
+            Some(raw) => raw,
+            None => {
                 return Section::with_fields(
                     Status::Ok,
                     "winget upgrade unavailable",

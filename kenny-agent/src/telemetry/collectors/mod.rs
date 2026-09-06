@@ -190,9 +190,43 @@ pub fn section_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// A full snapshot must finish, not merely eventually return.
+    ///
+    /// This is the one test that runs every collector for real, so on Windows it is
+    /// also the one that meets every OS probe the agent makes. `collect_all` promises
+    /// a bounded snapshot — a pool of [`MAX_COLLECTOR_THREADS`] workers, each probe
+    /// held to `winps::PROBE_BUDGET` — and a collector that shells out without that
+    /// bound silently breaks the promise: the run does not fail, it just never ends,
+    /// taking the whole test binary with it (a `#[test]` cannot time itself out).
+    /// Collecting on a detached thread and waiting on a channel turns that into a
+    /// failure that names the budget it blew.
+    ///
+    /// The budget is the worst case the pool allows — every section queued behind a
+    /// full-budget probe — with room to spare, so it can only be reached by a probe
+    /// that is not bounded at all.
+    const SNAPSHOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Run `collect_all` off-thread and fail rather than hang if it overruns
+    /// [`SNAPSHOT_BUDGET`]. The thread is left running on timeout — it cannot be
+    /// killed — but the process exits when the harness finishes.
+    fn collect_all_within_budget(wanted: &[String]) -> Map<String, Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wanted = wanted.to_vec();
+        std::thread::spawn(move || {
+            let _ = tx.send(collect_all(&wanted));
+        });
+        rx.recv_timeout(SNAPSHOT_BUDGET).unwrap_or_else(|_| {
+            panic!(
+                "collect_all did not finish within {}s: some collector runs an \
+                 unbounded OS probe instead of holding to winps::PROBE_BUDGET",
+                SNAPSHOT_BUDGET.as_secs()
+            )
+        })
+    }
+
     #[test]
     fn collect_all_covers_every_section() {
-        let snap = collect_all(&[]);
+        let snap = collect_all_within_budget(&[]);
         assert_eq!(snap.len(), section_names().len());
         for (name, value) in &snap {
             assert!(

@@ -192,6 +192,7 @@ fn slice_cols(line: &str, start: usize, end: usize) -> String {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use std::time::Duration;
     use tokio::process::Command;
 
     /// Run a winget subcommand and report ok + combined log.
@@ -206,13 +207,30 @@ mod windows_impl {
         Ok(json!({ "ok": output.status.success(), "log": log }))
     }
 
+    /// How long a read-only `winget list` may take before we give up on it.
+    ///
+    /// Unlike the mutating `winget_*` tools — an install legitimately runs for
+    /// minutes, so those stay unbounded — listing what is installed is a query, and
+    /// a `winget` that has not answered within this window is wedged: its source
+    /// refresh cannot reach the network, or it is waiting on a source it will never
+    /// get. An unbounded query has no failure mode, only an unbounded wait, and the
+    /// caller has no deadline of its own to fall back on.
+    const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// `winget_list` real implementation: run `winget list` and parse its
     /// fixed-width table into `{id,name,version,available}` rows.
     pub async fn list() -> Result<Value, (ErrorCode, String)> {
-        let output = Command::new("winget")
+        let fut = Command::new("winget")
             .args(["list", "--accept-source-agreements"])
-            .output()
+            .output();
+        let output = tokio::time::timeout(LIST_TIMEOUT, fut)
             .await
+            .map_err(|_| {
+                (
+                    ErrorCode::Timeout,
+                    format!("winget list exceeded {}s", LIST_TIMEOUT.as_secs()),
+                )
+            })?
             .map_err(|e| (ErrorCode::ExecFailed, format!("winget spawn failed: {e}")))?;
         let raw = String::from_utf8_lossy(&output.stdout);
         Ok(json!({ "packages": super::parse_table(&raw) }))

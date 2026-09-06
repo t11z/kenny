@@ -12,9 +12,9 @@
 //!
 //! Tools are split by whether their handler actually reads `args`:
 //! - [`RANDOM_LOOP_TOOLS`] either deserialize `args` into something handler-specific
-//!   (`fs_*`, `telemetry_collect`) or are mutating and gated off before a handler
-//!   ever sees `args` — cheap either way, so these run thousands of times with fresh
-//!   random args each iteration.
+//!   (`fs_*`) or are mutating and gated off before a handler ever sees `args` —
+//!   cheap either way, so these run thousands of times with fresh random args each
+//!   iteration.
 //! - [`SMOKE_ONCE_TOOLS`] are non-mutating handlers whose top-level signature is
 //!   `_args: Value` (Windows-only diagnostics/network/remotehelp/webfilter status
 //!   reads, `winget_list`): they ignore `args` completely, so randomizing it
@@ -27,6 +27,17 @@
 //!   exercises it behind the coexist gate, its real Windows capture path depends on
 //!   an interactive session/IPC pipe that a CI runner may not have, so it belongs in
 //!   the dedicated integration job, not a unit-test fuzz loop.
+//! - `telemetry_collect` belongs in neither list, and is never dispatched here with
+//!   random args. Its handler reads `args` only to build a section filter, and
+//!   anything that is not an array of strings under `sections` selects *every*
+//!   section — a full snapshot, which on Windows is ~35 PowerShell/CIM probes and on
+//!   Linux is the same number of `n/a` stubs. Random args land on that case the vast
+//!   majority of the time, so a random loop over this tool costs a real snapshot per
+//!   iteration for no coverage the two split-out paths do not already give: the
+//!   args-reading half is fuzzed as the pure [`dispatch::wanted_sections`] in
+//!   [`fuzz_telemetry_section_filter_never_panics`], and the routing half is
+//!   dispatched for real in [`fuzz_dispatch_never_panics`] behind an explicit
+//!   section filter, so at most one cheap collector ever runs.
 
 use serde_json::{json, Map, Value};
 
@@ -56,7 +67,6 @@ const RANDOM_LOOP_TOOLS: &[&str] = &[
     "account_delete",
     "account_session_action",
     "password_policy_set",
-    "telemetry_collect",
     "agent_update",
     "",
     "not_a_real_tool",
@@ -254,10 +264,67 @@ async fn fuzz_dispatch_never_panics() {
         }
     }
 
+    // `telemetry_collect` routes for real, but always behind an explicit section
+    // filter (see module docs), so this covers the dispatch path without ever asking
+    // for the unfiltered snapshot: one filter naming a single cheap portable
+    // collector, one naming nothing that exists (which runs no collector at all).
+    for sections in [json!(["memory"]), json!(["🔥not-a-section", "", "\u{0}"])] {
+        let args = json!({ "sections": sections });
+        if let Err(p) = dispatch_once("telemetry_collect", args).await {
+            panics.push(p);
+        }
+    }
+
     assert!(
         panics.is_empty(),
         "fuzzing found {} panicking (tool, args) pair(s): {:#?}",
         panics.len(),
         &panics[..panics.len().min(5)]
+    );
+}
+
+/// `telemetry_collect`'s only args-reading code, driven with the same adversarial
+/// args the dispatch loop uses.
+///
+/// The tool itself is kept out of that loop because random args select the full
+/// snapshot (see module docs), so this pins what the loop would otherwise have
+/// covered: the filter never panics on any shape of `args`, and it never invents a
+/// section name — every name it returns was a string in the caller's own `sections`
+/// array, so a hostile server cannot steer collection to anything it did not ask for
+/// by name.
+#[test]
+fn fuzz_telemetry_section_filter_never_panics() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    const ITERATIONS: usize = 8_000;
+    let (mut named, mut unfiltered) = (0usize, 0usize);
+
+    for _ in 0..ITERATIONS {
+        let args = random_args(&mut rng, "telemetry_collect");
+        let wanted = crate::dispatch::wanted_sections(&args);
+        let offered: Vec<&str> = args
+            .get("sections")
+            .and_then(|s| s.as_array())
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        for name in &wanted {
+            assert!(
+                offered.contains(&name.as_str()),
+                "filter returned {name:?}, which was not in the args: {args:#?}"
+            );
+        }
+        if wanted.is_empty() {
+            unfiltered += 1;
+        } else {
+            named += 1;
+        }
+    }
+
+    // Both branches must actually be reached, or this test passes without having
+    // exercised the one that matters. `named` is the path that reads strings out of
+    // the array; `unfiltered` is the path that asks for every section — the reason
+    // the tool is not in the dispatch loop in the first place.
+    assert!(
+        named > 0 && unfiltered > 0,
+        "{named} named, {unfiltered} unfiltered — the generator no longer reaches both branches"
     );
 }

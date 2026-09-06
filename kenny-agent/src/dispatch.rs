@@ -100,18 +100,29 @@ async fn run(tool: &str, args: Value) -> Result<Value, (ErrorCode, String)> {
     }
 }
 
-/// `telemetry_collect` — return the snapshot map (optionally a subset of sections).
-fn telemetry_collect(args: Value) -> Result<Value, (ErrorCode, String)> {
-    let sections: Vec<String> = args
-        .get("sections")
+/// The section filter `telemetry_collect` reads out of its wire args.
+///
+/// This is the only part of `telemetry_collect` that looks at `args` at all — the
+/// collectors themselves are args-blind — so it is the whole attacker-reachable
+/// surface of the tool. Split out as a pure function so adversarial args can be
+/// driven through it (see `fuzz_tests`) without running a real snapshot.
+///
+/// Anything that is not an array of strings under `sections` yields an empty
+/// filter, which `collect_all` reads as "every section".
+pub(crate) fn wanted_sections(args: &Value) -> Vec<String> {
+    args.get("sections")
         .and_then(|s| s.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default();
-    let snapshot = crate::telemetry::collectors::collect_all(&sections);
+        .unwrap_or_default()
+}
+
+/// `telemetry_collect` — return the snapshot map (optionally a subset of sections).
+fn telemetry_collect(args: Value) -> Result<Value, (ErrorCode, String)> {
+    let snapshot = crate::telemetry::collectors::collect_all(&wanted_sections(&args));
     Ok(json!(snapshot))
 }
 
