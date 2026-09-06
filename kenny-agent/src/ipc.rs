@@ -12,6 +12,14 @@
 
 use std::io::{self, Read, Write};
 
+/// Upper bound on a single frame's payload. The largest real payload on these pipes is a
+/// full-desktop PNG screenshot ([`crate::screencap_ipc`]); 128 MiB is generous headroom
+/// above that while still ruling out a peer's bogus length prefix (up to `u32::MAX`, ~4
+/// GiB) forcing a huge upfront `vec![0u8; len]` allocation before a single payload byte
+/// is validated.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
+
 /// Read a length-prefixed frame (`u32` LE length + payload) from `r`.
 ///
 /// Off Windows the pipe server/client are compiled out, so the only callers are the unit
@@ -21,6 +29,12 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds {MAX_FRAME_LEN} byte limit"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
@@ -69,6 +83,17 @@ mod tests {
         let mut buf = 10u32.to_le_bytes().to_vec();
         buf.truncate(4);
         let mut cur = Cursor::new(buf);
+        assert!(read_frame(&mut cur).is_err());
+    }
+
+    #[test]
+    fn oversized_length_prefix_errors_without_allocating() {
+        // A peer claiming a ~4 GiB payload must be rejected by the length check, not
+        // turned into a `vec![0u8; len]` allocation attempt.
+        let mut cur = Cursor::new(u32::MAX.to_le_bytes().to_vec());
+        assert!(read_frame(&mut cur).is_err());
+
+        let mut cur = Cursor::new((MAX_FRAME_LEN as u32 + 1).to_le_bytes().to_vec());
         assert!(read_frame(&mut cur).is_err());
     }
 }
