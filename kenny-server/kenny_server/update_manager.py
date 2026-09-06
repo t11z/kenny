@@ -51,6 +51,41 @@ logger = logging.getLogger("kenny.update")
 ON_CONNECT_DELAY_S = 3.0
 
 
+async def record_agent_fetch(
+    store: UpdateStore, result: agent_release.FetchResult, *, channel: str = "stable"
+) -> None:
+    """Persist one agent-binary fetch outcome to the durable availability row.
+
+    Three code paths attempt (or deliberately skip) that fetch — startup
+    (``main.py``), the detection loop below, and the operator's manual retry
+    (``distribution.agent_binary_fetch``) — and each used to record it somewhere
+    different, or not at all. ADR-0040 already made ``update_availability`` the
+    durable record of detection outcomes; this is the one door into it, so a
+    failure survives the restart that ``app.state.last_fetch`` does not.
+
+    Best-effort by contract: a store hiccup must never break startup or turn a
+    status read into a 500.
+    """
+
+    try:
+        # `version`/`sha256` identify the artifact that is now staged — read off
+        # disk, so they stay right when the fetch failed and the previous binary
+        # is still what a new PC would receive. `ok`/`message` describe the
+        # attempt. Both meanings, kept apart.
+        staged = agent_release.binary_status(
+            manual_path=agent_binary_path(channel=channel), channel=channel
+        )
+        await store.set_availability(
+            _availability_key("agent", channel),
+            version=staged.version or "",
+            sha256=staged.sha256,
+            ok=result.ok,
+            message=result.message,
+        )
+    except Exception as exc:  # noqa: BLE001 - recording an outcome cannot become an outage
+        logger.warning("could not record agent fetch outcome: %s", exc)
+
+
 def default_campaign_dir(db_path: str) -> str:
     """Where pinned per-campaign agent binaries live, a sibling of the DB file."""
 
@@ -85,17 +120,13 @@ class UpdateManager:
 
         await self._expire_stale_campaign()
 
-        agent_fetch = None
-        if agent_release.github_configured():
-            agent_fetch = await asyncio.to_thread(agent_release.fetch_latest_agent_binary)
+        # The row records the **fetch**, in both fields. It used to carry
+        # `ok` from the on-disk probe and `message` from the fetch, so a failed
+        # refresh could read as ok=True next to its own error text. Whether a
+        # binary is present is already in `available`/`targets`.
+        agent_fetch = await asyncio.to_thread(agent_release.fetch_latest_agent_binary)
+        await record_agent_fetch(self.store, agent_fetch)
         status = agent_release.binary_status(manual_path=agent_binary_path())
-        await self.store.set_availability(
-            "agent",
-            version=status.version or "",
-            sha256=status.sha256,
-            ok=status.ok,
-            message=(agent_fetch.message if agent_fetch is not None else status.message),
-        )
 
         image_ref = self.settings.get("KENNY_SERVER_IMAGE_REF")
         server_result = await server_release.fetch_latest_server_tag(
@@ -115,7 +146,10 @@ class UpdateManager:
                     "server", version=__version__, ok=True, message="up to date"
                 )
         else:
-            logger.info("server image check skipped: %s", server_result.message)
+            # An unreachable image ref is a misconfiguration the operator should
+            # see, not routine noise. GHCR reads anonymously for a public
+            # package, so there is no "not configured" case left to excuse it.
+            logger.warning("server image check failed: %s", server_result.message)
 
         status_dev = await self._check_agent_dev()
         server_result_dev = await self._check_server_dev(image_ref)
@@ -135,20 +169,12 @@ class UpdateManager:
         """
 
         try:
-            agent_fetch_dev = None
-            if agent_release.github_configured():
-                agent_fetch_dev = await asyncio.to_thread(
-                    agent_release.fetch_latest_agent_binary, channel="dev"
-                )
+            agent_fetch_dev = await asyncio.to_thread(
+                agent_release.fetch_latest_agent_binary, channel="dev"
+            )
+            await record_agent_fetch(self.store, agent_fetch_dev, channel="dev")
             status_dev = agent_release.binary_status(
                 manual_path=agent_binary_path(channel="dev"), channel="dev"
-            )
-            await self.store.set_availability(
-                _availability_key("agent", "dev"),
-                version=status_dev.version or "",
-                sha256=status_dev.sha256,
-                ok=status_dev.ok,
-                message=(agent_fetch_dev.message if agent_fetch_dev is not None else status_dev.message),
             )
             return status_dev
         except Exception as exc:  # noqa: BLE001 - a dev-poll failure must never affect the stable result
@@ -273,6 +299,38 @@ class UpdateManager:
         if ok:
             self._cleanup_campaign_dir(campaign_id)
         return ok
+
+    async def suspend_campaign(self, campaign_id: str) -> bool:
+        """Pause ``campaign_id`` without discarding it: stop both triggers, keep everything.
+
+        Unlike :meth:`revoke_campaign`, this is deliberately *not* terminal and
+        does **not** clean up the pinned artifact directory — there would be
+        nothing left to resume from otherwise (ADR-0040's *More Information*).
+        It also leaves ``update_campaign_agents`` untouched, which is the
+        entire reason this state exists rather than "revoke, then re-approve
+        later": a fresh campaign gets a fresh ``campaign_id``, and per-agent
+        attempt/held bookkeeping is keyed ``(campaign_id, agent_id)`` — so
+        recreating would silently hand a held, likely crash-looping agent a
+        brand-new attempt budget. Suspending and later resuming the *same*
+        campaign keeps that agent held.
+
+        Only an ``active`` campaign can be suspended — a revoked, expired, or
+        already-completed campaign is refused (``False``), not silently
+        no-opped into a new state.
+        """
+
+        return await self.store.set_campaign_status(campaign_id, "suspended")
+
+    async def resume_campaign(self, campaign_id: str) -> bool:
+        """Reactivate a suspended campaign: :meth:`apply_now` and the on-connect
+        hook see it again, exactly as before it was suspended.
+
+        Only a ``suspended`` campaign can be resumed.
+        """
+
+        return await self.store.set_campaign_status(
+            campaign_id, "active", from_status="suspended"
+        )
 
     async def apply_now(self, campaign_id: str | None = None) -> dict[str, Any]:
         """Apply a pinned campaign to every currently-online, eligible agent."""

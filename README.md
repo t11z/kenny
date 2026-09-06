@@ -4,18 +4,21 @@
 
 # 🐕 kenny
 
-**Self-hosted remote administration _and fleet monitoring_ for Windows PCs, driven by Claude (MCP) and a web dashboard.**
+**Self-hosted remote administration _and fleet monitoring_ for Windows and Linux, driven by Claude (MCP) and a web dashboard.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-E8A33D.svg)](LICENSE)
-[![CI](https://github.com/t11z/kenny/actions/workflows/ci.yml/badge.svg)](https://github.com/t11z/kenny/actions/workflows/ci.yml)
-[![Docs](https://img.shields.io/badge/docs-mkdocs-E8A33D.svg)](https://t11z.github.io/kenny/)
-[![Release](https://img.shields.io/github/v/release/t11z/kenny?color=E8A33D)](https://github.com/t11z/kenny/releases)
+[![CI](https://github.com/nullthrone/kenny/actions/workflows/ci.yml/badge.svg)](https://github.com/nullthrone/kenny/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-E8A33D.svg)](https://nullthrone.github.io/kenny/)
+[![Release](https://img.shields.io/github/v/release/nullthrone/kenny?color=E8A33D)](https://github.com/nullthrone/kenny/releases)
 
 </div>
 
-kenny started as a way to look after the family's Windows PCs — keep an eye on disk space and
-Defender, fix things over the phone without "can you read me what it says" — operated through
-Claude instead of a clunky console. It works for any small fleet you administer with consent.
+kenny administers a small fleet of Windows and Linux machines from one place: pushed telemetry
+with server-side health rules and alerting, capability tools that act on a host, account
+governance, a web filter and screen time, and a ticket queue the people who use those machines
+can open themselves. Operate it through Claude over MCP, through the built-in chat, or by hand
+in the console. It is for the machines **you** administer, with the consent of the people who
+use them — family PCs, a home lab, a small office.
 
 ```mermaid
 flowchart LR
@@ -27,7 +30,7 @@ flowchart LR
     Tunnel["Agent tunnel /agent/ws"]
     Store[("Telemetry store<br/>SQLite")]
   end
-  Agent["kenny-agent (Windows PC)<br/>PowerShell · Win32 · winget<br/>filesystem · screenshot · collectors"]
+  Agent["kenny-agent (Windows / Linux host)<br/>PowerShell / shell · winget · systemd<br/>filesystem · screenshot · collectors"]
 
   Operator -->|https dashboard + chat| UI
   Operator --> Claude -->|MCP, OAuth| MCP
@@ -40,9 +43,9 @@ flowchart LR
 
 - **kenny-server** (Python / FastMCP): stable MCP endpoint for Claude, the agent tunnel,
   the telemetry store (SQLite), and the operator dashboard. One ASGI app, one port.
-- **kenny-agent** (Rust, single binary): runs on each Windows PC, dials **out** to the
-  server (NAT/firewall friendly), executes tool calls in the user's session, and pushes
-  periodic health snapshots.
+- **kenny-agent** (Rust, single binary): runs on each managed host — Windows or Linux —
+  dials **out** to the server (NAT/firewall friendly), executes tool calls in the user's
+  session, and pushes periodic health snapshots.
 
 ## ✨ Features
 
@@ -60,26 +63,22 @@ flowchart LR
   server-side **diff + forecast** (inventory changes, disk-fill and battery forecasts).
 
 ### Operator dashboard (web UI)
-- **Overview tab**: a high-level dashboard — KPIs, fleet-health & inventory donuts, a
-  security-posture row, problem-section bars, top-host rankings, a problem-flow Sankey, a
-  reliability heatmap, and a fleet health trend — every figure drill-down-able to its hosts.
-- **Fleet tab**: a traffic-light per PC and a per-agent **drill-down** — every telemetry
-  section (click for a structured detail popup, with an optional **AI recommendation** +
-  Auto-Remediate), a **health trend**, a **changes & forecast** panel, and the last screenshot.
-- **Copilot**: a server-hosted Claude chat docked in the console, with saved history and a
-  confirm-gate on state-changing tools.
-- **Activity tab**: a searchable, paged **tool-call audit log** and an **events & logs** stream;
-  a **Flagged** view groups everything needing attention by PC.
-- **Parental controls**: web-activity monitoring, a per-host web filter, and screen time.
-- Action buttons: refresh, **remote help** (Quick Assist), reinstall, re-share, update agent;
-  onboard a new PC from **Add a PC** (installer / share link).
-- Single-page, dependency-light; dark & light themes; cookie login at `/login`.
+Five destinations: **Today** (a landing page with one verdict sentence and at most three
+  items ranked by consequence), **Fleet** (card grid with per-host drill-down to full
+  telemetry detail, health trend, changes & forecast, and the last screenshot), **Inbox**
+  (approvals, flagged sections, and tickets in one queue), **Log** (filtered stream of tool
+  calls, alerts, and events), and **Admin** (settings, users, updates). **Ask kenny** is a
+  global overlay (⌘K) with server-hosted Claude chat, saved history, and a confirm-gate on
+  state-changing tools. Parental controls include web-activity monitoring, per-host web
+  filter, and screen time. Action buttons: refresh, **remote help** (Quick Assist), reinstall,
+  re-share, update agent; onboard a new PC from **Add a PC** (installer / share link).
+  Single-page, dependency-light; dark & light themes; cookie login at `/login`.
 
 <div align="center">
 
-![The kenny fleet console](docs/assets/screenshots/overview.png)
+![The kenny dashboard — Today view](docs/assets/screenshots/today.png)
 
-_The Overview dashboard — see the **[dashboard reference](docs/dashboard.md)** for the full tour._
+_The Today dashboard — see the **[dashboard reference](docs/dashboard.md)** for the full tour._
 
 </div>
 
@@ -96,7 +95,10 @@ _The Overview dashboard — see the **[dashboard reference](docs/dashboard.md)**
   `webfilter_get` · `webfilter_set` · `webfilter_push` · `web_activity_query`)
 - **Server-only orchestration**: `list_agents` · `select_agent` · `fleet_overview` ·
   `agent_health` · `agent_snapshot`
-- Windows-only tools have **portable Linux fallbacks**, so the agent builds and runs in CI/dev.
+- **Linux hosts are a first-class target** (ADR-0031/0034): static musl binary (x86_64 and
+  aarch64), a one-line install script, a systemd service, and server-triggered self-update.
+  Windows-only tools (`winget_*`, Defender, BitLocker) answer `unsupported` there, and the
+  server refuses a wrong-OS call before it reaches the wire.
 
 ### Family self-service via Discord (simplified ITSM)
 - An optional **Discord bot** (its own application — no shared/hosted bot exists): a family
@@ -160,7 +162,7 @@ _The Overview dashboard — see the **[dashboard reference](docs/dashboard.md)**
 
 ## 📚 Documentation
 
-The full docs site: **<https://t11z.github.io/kenny/>** (built from `docs/` with MkDocs Material).
+The full docs site: **<https://nullthrone.github.io/kenny/>** (built from `docs/` with MkDocs Material).
 
 - **[User guide](docs/user-guide.md)** — operator workflows: dashboard, chat, running tools,
   adding/updating agents (with diagrams).
@@ -206,7 +208,7 @@ Helper commands inside Claude Code: `/new-adr`, `/add-tool`, `/add-collector`,
 - **[Code of Conduct](CODE_OF_CONDUCT.md)** — Contributor Covenant.
 - **[Security policy](SECURITY.md)** — please report vulnerabilities **privately**, never in a
   public issue (kenny is a remote-admin tool).
-- Questions and ideas: **[GitHub Discussions](https://github.com/t11z/kenny/discussions)**.
+- Questions and ideas: **[GitHub Discussions](https://github.com/nullthrone/kenny/discussions)**.
 
 ## 📄 License
 

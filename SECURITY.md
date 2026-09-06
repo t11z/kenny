@@ -1,14 +1,15 @@
 # Security Policy
 
-kenny is a **remote-administration tool**: a server that can run PowerShell, install
-packages, and read files on enrolled Windows PCs. Please treat vulnerabilities accordingly.
+kenny is a **remote-administration tool**: a server that can run PowerShell or a shell, install
+packages, and read files on enrolled Windows and Linux hosts. Please treat vulnerabilities
+accordingly.
 
 ## Reporting a vulnerability
 
 **Do not open a public issue, PR, or Discussion for a security problem** — that would
 disclose it before a fix exists.
 
-Instead, report privately via **[GitHub Security Advisories](https://github.com/t11z/kenny/security/advisories/new)**
+Instead, report privately via **[GitHub Security Advisories](https://github.com/nullthrone/kenny/security/advisories/new)**
 ("Report a vulnerability"). If you can't use that, contact the maintainer privately via
 **[@t11z](https://github.com/t11z)**.
 

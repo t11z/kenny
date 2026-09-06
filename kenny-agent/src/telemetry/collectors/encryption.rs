@@ -43,8 +43,10 @@ Get-BitLockerVolume | ForEach-Object {
 "#;
 
         let Some(v) = winps::run_json(script) else {
+            // No reading: empty `volumes` makes the server's rule defer
+            // rather than call the drive encrypted -- or unencrypted.
             return Section::with_fields(
-                Status::Warn,
+                Status::Ok,
                 "BitLocker state unavailable",
                 json!({ "volumes": [] }),
             );
@@ -65,12 +67,15 @@ Get-BitLockerVolume | ForEach-Object {
             mount == sys_norm && vol.get("protection_status").and_then(Value::as_i64) != Some(1)
         });
 
-        let (status, summary) = if system_unprotected {
-            (Status::Warn, format!("{sys_norm} not BitLocker-protected"))
+        // Report, do not grade: an unencrypted system drive is a standing
+        // fact the server lists as posture (`health_rules._rule_encryption`),
+        // never an alarm this binary raises and the server cannot lower.
+        let summary = if system_unprotected {
+            format!("{sys_norm} not BitLocker-protected")
         } else {
-            (Status::Ok, "system drive encrypted".to_string())
+            "system drive encrypted".to_string()
         };
-        Section::with_fields(status, summary, json!({ "volumes": volumes }))
+        Section::with_fields(Status::Ok, summary, json!({ "volumes": volumes }))
     }
 }
 
@@ -81,5 +86,11 @@ mod tests {
     #[test]
     fn encryption_section_is_valid() {
         assert!(collect().into_value()["volumes"].is_array());
+    }
+
+    #[test]
+    fn encryption_never_grades_the_host() {
+        // Report, do not grade (ADR-0058): the verdict is `health_rules._rule_encryption`'s.
+        assert_eq!(collect().into_value()["status"], "ok");
     }
 }

@@ -24,7 +24,8 @@ import secrets
 import uuid
 from typing import Any, Awaitable, Callable
 
-from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
+from pydantic import ValidationError
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from datetime import datetime, timezone
 
@@ -132,6 +133,7 @@ class AgentTunnel:
         policy_store: PolicyStore | None = None,
         webfilter: WebFilterService | None = None,
         on_agent_online: Callable[[str], Awaitable[None]] | None = None,
+        after_insert: Callable[[str, dict[str, Any]], Any] | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -145,6 +147,11 @@ class AgentTunnel:
         # tunnel to update_manager. Never awaited inline: a slow or failing hook
         # must not delay serving the connection or break the handshake.
         self.on_agent_online = on_agent_online
+        # Optional synchronous hook called with ``(agent_id, snapshot)`` right
+        # after a telemetry snapshot is stored -- the seam the persisted event
+        # classification (ADR-0058) uses to kick its background batch. Never
+        # awaited, wrapped in its own guard: ingestion does not depend on it.
+        self.after_insert = after_insert
         # request_id -> Future[Response]
         self._pending: dict[str, asyncio.Future[Response]] = {}
 
@@ -265,7 +272,21 @@ class AgentTunnel:
 
     async def _handshake(self, websocket: WebSocket) -> str | None:
         raw = await websocket.receive_text()
-        frame = parse_frame(raw)
+        try:
+            frame = parse_frame(raw)
+        except ValidationError:
+            # Malformed JSON or a frame that doesn't match any known shape
+            # (pydantic wraps JSON decode errors into ValidationError too, since
+            # this goes through validate_json). Nobody is authenticated yet, so
+            # this is reachable by anyone who can open a socket to /agent/ws —
+            # treat it the same as "first frame was not register": close 4400
+            # rather than let the exception propagate out of the handshake.
+            logger.warning(
+                "agent handshake rejected: first frame was not valid JSON/a known "
+                "frame; closing 4400"
+            )
+            await websocket.close(code=4400)
+            return None
         if not isinstance(frame, Register):
             logger.warning(
                 "agent handshake rejected: first frame was %s, expected register; "
@@ -412,7 +433,19 @@ class AgentTunnel:
                     _MAX_FRAME_BYTES,
                 )
                 continue
-            frame = parse_frame(raw)
+            try:
+                frame = parse_frame(raw)
+            except ValidationError:
+                # Malformed JSON or a frame that doesn't match any known shape
+                # (pydantic wraps JSON decode errors into ValidationError too,
+                # since this goes through validate_json). An already-authenticated
+                # agent can push arbitrary frames at will, so — like the size caps
+                # above — drop the one bad frame and keep the tunnel open rather
+                # than let the exception tear down the connection.
+                logger.warning(
+                    "dropping unparseable frame from %s (%d bytes)", agent_id, len(raw)
+                )
+                continue
 
             # The host may have been removed from inventory mid-connection
             # (DELETE /api/agent/{id} → inventory.purge_agent → registry.remove).
@@ -506,6 +539,12 @@ class AgentTunnel:
                     logger.exception(
                         "telemetry insert failed for %s; keeping tunnel open", frame.agent_id
                     )
+                else:
+                    if self.after_insert is not None:
+                        try:
+                            self.after_insert(frame.agent_id, snapshot)
+                        except Exception:  # noqa: BLE001 - a hook bug must not touch the tunnel
+                            logger.exception("after_insert hook failed for %s", frame.agent_id)
                     continue
                 logger.debug("telemetry from %s at %s", frame.agent_id, frame.collected_at)
             elif isinstance(frame, Log):
@@ -548,6 +587,3 @@ class AgentTunnel:
             if not future.done():
                 future.set_exception(ToolError("internal", "agent disconnected"))
 
-    @staticmethod
-    def _is_open(websocket: WebSocket) -> bool:
-        return websocket.client_state == WebSocketState.CONNECTED

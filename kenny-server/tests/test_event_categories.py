@@ -63,13 +63,9 @@ class _SlowFakeClient:
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    ec._cache.clear()
-    ec._inflight.clear()
-    ec._failed_until.clear()
+    ec.reset_state()
     yield
-    ec._cache.clear()
-    ec._inflight.clear()
-    ec._failed_until.clear()
+    ec.reset_state()
 
 
 def _run(coro):
@@ -313,3 +309,145 @@ def test_failed_batch_backs_off_then_retries():
     mapping3 = _run(ec.categorize_events(good, groups))
     assert mapping3[("disk", 51)]["category"] == "Disk & storage"
     assert good.calls[0] == 1
+
+
+# -- persistence + the synchronous read-path stamp (ADR-0058) -----------------
+
+
+class _MemoryStore:
+    """A stand-in for ``EventClassificationStore`` that records what the
+    classifier writes through and serves it back on ``list``."""
+
+    def __init__(self, rows: list[dict] | None = None) -> None:
+        self.rows: dict[tuple[str, int], dict] = {
+            (r["source"], r["event_id"]): dict(r) for r in rows or []
+        }
+        self.upserts: list[list[dict]] = []
+        self.deleted_except: list[str] = []
+
+    async def list(self):
+        return [dict(r) for r in self.rows.values()]
+
+    async def upsert_many(self, rows):
+        self.upserts.append([dict(r) for r in rows])
+        for r in rows:
+            self.rows[(r["source"], r["event_id"])] = dict(r)
+
+    async def delete_model_except(self, model):
+        self.deleted_except.append(model)
+        stale = [k for k, r in self.rows.items() if r.get("model") != model]
+        for k in stale:
+            del self.rows[k]
+        return len(stale)
+
+
+@pytest.fixture
+def _memory_store():
+    store = _MemoryStore()
+    ec.bind_store(store)
+    yield store
+    ec.bind_store(None)
+
+
+def test_mark_stamps_only_cached_keys_and_is_sync():
+    ec._cache_put(("disk", 51), {"category": "Disk & storage", "severity": "serious", "cause": "bad sectors"})
+    snapshot = {"reliability": {"events": [
+        {"source": "disk", "event_id": 51, "count": 3, "suppressed": True},
+        {"source": "Mystery", "event_id": 9, "count": 1},
+    ]}}
+    # Plain call, no loop, no client: the read-path seam is synchronous.
+    ec.mark("pc1", snapshot)
+    cached, missing = snapshot["reliability"]["events"]
+    assert cached["category"] == "Disk & storage"
+    assert cached["severity"] == "serious"
+    assert cached["suspected_cause"] == "bad sectors"
+    assert cached["suppressed"] is True  # ADR-0041 markers untouched
+    # A miss is left unstamped -- never stamped with the fallback, which a
+    # later annotate_snapshots() could not tell from a real verdict.
+    assert "severity" not in missing and "category" not in missing
+    # Non-reliability / malformed snapshots are a no-op, not an error.
+    ec.mark("pc1", None)
+    ec.mark("pc1", {"reliability": {"events": "nope"}})
+
+
+def test_classify_task_writes_through_to_the_store(_memory_store):
+    client = _FakeClient('[{"category": "Disk & storage", "severity": "serious", "cause": "bad sectors"}]')
+    groups = [{"source": "disk", "event_id": 51, "sample": "paging error"}]
+    _run(ec.categorize_events(client, groups))
+    assert _memory_store.upserts == [[{
+        "source": "disk", "event_id": 51, "category": "Disk & storage",
+        "severity": "serious", "cause": "bad sectors", "model": ec.CATEGORIZE_MODEL,
+    }]]
+
+
+def test_persisted_classifications_survive_a_restart(_memory_store):
+    _memory_store.rows[("disk", 51)] = {
+        "source": "disk", "event_id": 51, "category": "Disk & storage", "severity": "serious",
+        "cause": "bad sectors", "model": ec.CATEGORIZE_MODEL, "classified_at": "2026-09-01T00:00:00Z",
+    }
+    # A row from an older classifier must be dropped, not trusted.
+    _memory_store.rows[("old", 1)] = {
+        "source": "old", "event_id": 1, "category": "Other", "severity": "benign",
+        "cause": "", "model": "claude-haiku-3", "classified_at": "2025-01-01T00:00:00Z",
+    }
+    # A row whose enum drifted (hand-edited DB) degrades to the safe defaults.
+    _memory_store.rows[("odd", 2)] = {
+        "source": "odd", "event_id": 2, "category": "Nonsense", "severity": "fatal",
+        "cause": "x", "model": ec.CATEGORIZE_MODEL, "classified_at": "2026-09-01T00:00:00Z",
+    }
+    ec._cache.clear()  # "restart"
+    assert _run(ec.load_persisted()) == 2
+    assert _memory_store.deleted_except == [ec.CATEGORIZE_MODEL]
+    assert ec._cache[("disk", 51)] == {"category": "Disk & storage", "severity": "serious", "cause": "bad sectors"}
+    assert ec._cache[("odd", 2)] == {"category": ec.FALLBACK, "severity": ec.SEVERITY_FALLBACK, "cause": "x"}
+    assert ("old", 1) not in ec._cache
+    # And a classify call now finds the persisted verdict without a client.
+    result = _run(ec.categorize_events(None, [{"source": "disk", "event_id": 51}]))
+    assert result[("disk", 51)]["severity"] == "serious"
+
+
+def test_a_failing_store_never_fails_a_classification(_memory_store):
+    async def _boom(rows):
+        raise RuntimeError("disk full")
+
+    _memory_store.upsert_many = _boom  # type: ignore[assignment]
+    client = _FakeClient('[{"category": "Other", "severity": "notable", "cause": ""}]')
+    result = _run(ec.categorize_events(client, [{"source": "x", "event_id": 1}]))
+    assert result[("x", 1)]["severity"] == "notable"
+    assert ec._cache[("x", 1)]["severity"] == "notable"
+
+
+def test_schedule_classification_is_fire_and_forget_and_dedupes_inflight(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    client = _SlowFakeClient('[{"category": "Other", "severity": "notable", "cause": ""}]', delay=0.3)
+    snapshot = {"reliability": {"events": [{"source": "x", "event_id": 1, "sample": "s"}]}}
+
+    async def _scenario():
+        t0 = time.monotonic()
+        started = ec.schedule_classification("pc1", snapshot, client_factory=lambda: client)
+        assert started is True
+        assert time.monotonic() - t0 < 0.1  # returned before the client answered
+        # Same pattern again while the batch is in flight -> rides along.
+        assert ec.schedule_classification("pc1", snapshot, client_factory=lambda: client) is False
+        await asyncio.sleep(0.05)  # let the batch task start its (slow) call
+        assert client.calls[0] == 1
+        await asyncio.gather(*set(ec._inflight.values()))
+        assert ec._cache[("x", 1)]["severity"] == "notable"
+        # Everything cached -> nothing to do.
+        assert ec.schedule_classification("pc1", snapshot, client_factory=lambda: client) is False
+
+    _run(_scenario())
+    assert client.calls[0] == 1
+
+
+def test_schedule_classification_is_a_noop_without_a_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client = _FakeClient('[{"category": "Other", "severity": "notable", "cause": ""}]')
+    snapshot = {"reliability": {"events": [{"source": "x", "event_id": 1}]}}
+
+    async def _scenario():
+        assert ec.schedule_classification("pc1", snapshot, client_factory=lambda: client) is False
+
+    _run(_scenario())
+    assert client.calls[0] == 0
+    assert not ec._inflight

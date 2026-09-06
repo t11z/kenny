@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from functools import partial
 
 from starlette.testclient import TestClient
 
+from kenny_server import PROTOCOL_VERSION, agent_release
 from kenny_server.main import build_app
-from kenny_server.webui import _fleet_summary
+from kenny_server.webui import _fleet_summary, _severity_label
 
 
 def _bearer(app):
@@ -44,6 +46,41 @@ def test_fleet_summary_warn_when_no_crit():
 
 def test_fleet_summary_no_telemetry():
     assert _fleet_summary({"overall": "unknown", "sections": {}}, None) == "no telemetry yet"
+
+
+def test_severity_label_healthy():
+    health = {"overall": "ok", "sections": {"disk": {"status": "ok", "summary": "C: 41% full"}}}
+    assert _severity_label(health, {"disk": {}}) == "HEALTHY"
+
+
+def test_severity_label_critical_names_the_worst_section():
+    health = {
+        "overall": "crit",
+        "sections": {
+            "disk": {"status": "crit", "summary": "C: 96% full"},
+            "reboot_pending": {"status": "warn", "summary": "Reboot required"},
+        },
+    }
+    assert _severity_label(health, {"disk": {}, "reboot_pending": {}}) == "CRITICAL · DISK"
+
+
+def test_severity_label_warning_when_no_crit():
+    health = {"overall": "warn", "sections": {"win_update": {"status": "warn", "summary": "x"}}}
+    assert _severity_label(health, {"win_update": {}}) == "WARNING · WIN UPDATE"
+
+
+def test_severity_label_no_telemetry():
+    assert _severity_label({"overall": "unknown", "sections": {}}, None) == "NO DATA"
+
+
+def test_fleet_endpoint_carries_severity_label(tmp_path) -> None:
+    app = build_app(db_path=str(tmp_path / "severity-label.sqlite"))
+    with TestClient(app) as c:
+        snapshot = {"disk": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": 97}]}}
+        c.portal.call(partial(app.state.store.insert, "hot-pc", "2026-08-01T00:00:00+00:00", snapshot))
+        body = c.get("/api/fleet", headers=_bearer(app)).json()
+        agent = next(a for a in body["agents"] if a["agent_id"] == "hot-pc")
+        assert agent["severity_label"] == "CRITICAL · DISK"
 
 
 def test_agent_endpoint_reports_ai_enabled(tmp_path, monkeypatch):
@@ -128,7 +165,7 @@ def test_settings_put_and_reset_roundtrip(tmp_path):
                   headers=_bearer(app), json={"value": 120})
         assert r.status_code == 200
         assert r.json() == {"key": "KENNY_ALERT_COOLDOWN_SECS", "source": "db",
-                            "lifecycle": "live", "value": 120}
+                            "lifecycle": "live", "editable": True, "value": 120}
         # reflected in the list
         flat = {s["key"]: s for g in c.get("/api/settings", headers=_bearer(app)).json()["groups"]
                 for s in g["settings"]}
@@ -178,15 +215,19 @@ def test_events_endpoint_filters(tmp_path):
         )
         c.portal.call(partial(es.insert_audit, agent_id="example-pc", tool="winget_update", ok=True))
 
-        # Unfiltered: all three events, newest-first.
+        # Unfiltered: the three seeded events, newest-first. The server also
+        # logs during boot (ADR-0017 persists its own records here), so scope
+        # the counts to what this test seeded rather than to an empty server.
+        seeded_at = {"2026-06-05T10:00:00Z", "2026-06-05T10:00:01Z"}
         entries = c.get("/api/events", headers=_bearer(app)).json()["entries"]
-        assert len(entries) == 3
+        seeded = [e for e in entries if e["at"] in seeded_at or e["kind"] == "audit"]
+        assert len(seeded) == 3
         assert set(entries[0]) >= {"at", "agent_id", "source", "level", "kind", "message"}
 
         # kind filter.
         logs = c.get("/api/events?kind=log", headers=_bearer(app)).json()["entries"]
         assert {e["kind"] for e in logs} == {"log"}
-        assert len(logs) == 2
+        assert len([e for e in logs if e["at"] in seeded_at]) == 2
 
         # agent + level filters compose.
         warns = c.get("/api/events?agent=example-pc&level=warn", headers=_bearer(app)).json()["entries"]
@@ -425,3 +466,96 @@ def test_refresh_reports_stored_true_on_success(tmp_path):
     assert body["ok"] is True
     assert body["stored"] is True
     assert "warning" not in body
+
+
+def test_about_reports_server_protocol_and_repo(tmp_path) -> None:
+    """The identity the About dialog renders.
+
+    Nothing else pinned this shape, so the route could drop or rename a key and
+    every Python test would still pass while the console silently rendered a
+    broken GitHub link. ``repo`` in particular is what the dashboard builds
+    ``github.com/{repo}`` from (kenny-web `AboutModal`).
+    """
+
+    app = build_app(db_path=str(tmp_path / "about.sqlite"))
+    with TestClient(app) as c:
+        resp = c.get("/api/about", headers=_bearer(app))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"server_version", "protocol_version", "repo"}
+    assert body["protocol_version"] == PROTOCOL_VERSION
+    assert body["repo"] == agent_release.github_repo()
+
+
+def test_about_requires_authentication(tmp_path) -> None:
+    """About sits at the authenticated floor — no ``min_role``, but not open.
+
+    That floor is the only access control on it, which is also why the dialog
+    needs no role gating of its own.
+    """
+
+    app = build_app(db_path=str(tmp_path / "about-auth.sqlite"))
+    with TestClient(app) as c:
+        assert c.get("/api/about").status_code == 401
+
+
+# -- posture (ADR-0058) ------------------------------------------------------
+
+_POSTURE_ONLY_SNAPSHOT = {
+    "disk": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": 40}]},
+    "encryption": {"status": "ok", "summary": "C: not BitLocker-protected",
+                   "volumes": [{"mount": "C:", "protection_status": 0}]},
+    "listening_ports": {"status": "ok", "summary": "", "ports": [
+        {"proto": "tcp", "port": 3389, "address": "0.0.0.0", "pid": 1, "process": "svchost"}]},
+}
+
+
+def test_fleet_summary_and_label_for_a_posture_only_host() -> None:
+    from kenny_server.health_rules import evaluate_snapshot
+
+    health = evaluate_snapshot(_POSTURE_ONLY_SNAPSHOT)
+    assert health["overall"] == "ok"
+    assert _fleet_summary(health, _POSTURE_ONLY_SNAPSHOT) == "no incidents · 2 posture finding(s)"
+    # Posture is not shouted on the card.
+    assert _severity_label(health, _POSTURE_ONLY_SNAPSHOT) == "HEALTHY"
+
+
+def test_fleet_and_agent_endpoints_carry_posture_tier_and_age(tmp_path) -> None:
+    """Joined across the store, the alert loop's state and the read paths: a
+    posture-only host is `ok` with its posture sections listed, and once the
+    alert loop has recorded the section, `/api/agent` shows how long it has
+    stood."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from kenny_server.alerting import AlertEngine
+
+    app = build_app(db_path=str(tmp_path / "posture.sqlite"))
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=timezone.utc)
+    with TestClient(app) as c:
+        h = _bearer(app)
+        c.portal.call(partial(app.state.store.insert, "pc1", (now - timedelta(days=2)).isoformat(),
+                              _POSTURE_ONLY_SNAPSHOT))
+        agent = next(a for a in c.get("/api/fleet", headers=h).json()["agents"] if a["agent_id"] == "pc1")
+        assert agent["overall"] == "ok"
+        assert agent["flagged_sections"] == []
+        assert agent["posture_sections"] == ["encryption", "listening_ports"]
+        assert agent["severity_label"] == "HEALTHY"
+        assert agent["summary"] == "no incidents · 2 posture finding(s)"
+
+        sections = c.get("/api/agent/pc1", headers=h).json()["health"]["sections"]
+        assert sections["encryption"]["tier"] == "posture"
+        assert sections["encryption"]["attention"] is False
+        assert sections["encryption"]["since"] is None  # the loop has not seen it yet
+        assert sections["disk"]["tier"] == "none"
+
+        class _Registry:
+            def get(self, agent_id):
+                return None
+
+        engine = AlertEngine(store=app.state.store, alert_state=app.state.alert_state,
+                             event_store=app.state.event_store, registry=_Registry(), notifiers=[])
+        assert c.portal.call(partial(engine.evaluate_once, now - timedelta(days=1))) == []
+        sections = c.get("/api/agent/pc1", headers=h).json()["health"]["sections"]
+        assert sections["encryption"]["since"] == (now - timedelta(days=1)).isoformat()
+        assert sections["encryption"]["age_seconds"] >= 86_400

@@ -77,8 +77,8 @@ clients share one bucket). The bundled TLS profile sets this for you.
 | `KENNY_AGENT_BINARY` | server | — | Path to the prebuilt `kenny-agent.exe` the server serves for **Windows** installer download + self-update. Overrides the GitHub auto-fetch when set. |
 | `KENNY_AGENT_BINARY_LINUX` | server | — | Path to the prebuilt **Linux** `x86_64` agent binary (static musl) the server serves for the Linux install script + self-update. Overrides the GitHub auto-fetch when set. |
 | `KENNY_AGENT_BINARY_LINUX_AARCH64` | server | — | As above for **Linux `aarch64`** (Raspberry Pi / ARM NAS). |
-| `KENNY_GITHUB_TOKEN` | server | — | GitHub token enabling auto-fetch of the agent binary from Releases (ADR-0015). When set (and `KENNY_AGENT_BINARY` is not), the server fetches `kenny-agent.exe` on startup. |
-| `KENNY_GITHUB_REPO` | server | `t11z/kenny` | Repo to fetch the agent binary release from. |
+| `KENNY_GITHUB_TOKEN` | server | — | Token for polling a **private** `kenny-server` package on GHCR (ADR-0040). The agent binary and the changelog are read from GitHub anonymously (ADR-0057) and ignore it. |
+| `KENNY_GITHUB_REPO` | server | `nullthrone/kenny` | Repo to fetch the agent binary release from. |
 | `KENNY_AGENT_BINARY_CACHE` | server | `<dir of KENNY_DB_PATH>/kenny-agent.exe` | Where the auto-fetched binary is cached (the `/data` volume in the container). |
 | `KENNY_AGENT_VERSION` | server | `0.2.0` | **Fallback** version label only — the GitHub release tag of the fetched binary leads (ADR-0015). Used when no tag is known (e.g. a manually-placed binary without a `.version` sidecar). |
 | `KENNY_HOST` / `KENNY_PORT` | server | `127.0.0.1` / `8000` | Bind address (container sets `0.0.0.0`). |
@@ -90,7 +90,7 @@ clients share one bucket). The bundled TLS profile sets this for you.
 | `KENNY_COEXIST_PROCESSES` | agent | anti-cheat set | Comma-separated extra process names to treat as "a protected game is running", extending the built-in anti-cheat list (`EasyAntiCheat.exe`, `BEService*.exe`, …). Add game exes here, e.g. `ARC-Raiders.exe`. Matched case- and `.exe`-insensitively. |
 | `KENNY_COEXIST_POLL_SECS` | agent | `5` | How often the agent checks whether a watched process is running. |
 | `KENNY_COEXIST_TELEMETRY_INTERVAL_SECS` | agent | `3600` | Telemetry push interval while a protected game is running (never shorter than `KENNY_TELEMETRY_INTERVAL_SECS`). |
-| `KENNY_SERVER_VERSION` | server | `0.0.0-dev` | Version string shown in the **About** box and `/api/about`. |
+| `KENNY_SERVER_VERSION` | server | `0.0.0-dev` | Version string shown on the sidebar's fleet line, in the **About kenny** dialog, and in `/api/about`. |
 | `KENNY_LOG_LEVEL` | server | `INFO` | Root log level. Server logs are also persisted to the event store (ADR-0017). |
 
 **Agent authentication & identity** (ADR-0022 mutual Ed25519 auth, token rotation):
@@ -114,8 +114,8 @@ clients share one bucket). The bundled TLS profile sets this for you.
 | `KENNY_ALERT_OFFLINE_AFTER_SECS` | `2700` | Mark an agent offline after this long without a push (≈ three missed 15-min pushes). |
 | `KENNY_DIGEST_ENABLED` | `1` | Weekly digest on/off. |
 | `KENNY_DIGEST_DAY` / `KENNY_DIGEST_HOUR` | `mon` / `8` | When to send the weekly digest. |
-| `KENNY_NTFY_URL` / `KENNY_NTFY_TOKEN` | — | ntfy topic URL (+ optional bearer) for push alerts. |
-| `KENNY_WEBHOOK_URL` | — | Generic JSON webhook for alerts. |
+| `KENNY_NTFY_URL` / `KENNY_NTFY_TOKEN` | — | ntfy topic URL (+ optional bearer) for push alerts. Also editable in Admin → Alerting & Digest, where a saved value wins over this one. |
+| `KENNY_WEBHOOK_URL` | — | Generic JSON webhook for alerts. Also editable in Admin → Alerting & Digest. |
 
 **Database backups** (see the **[Backup section](dashboard.md#backup)**,
 [ADR-0039](adr/0039-server-database-backup-and-restore.md)):
@@ -139,7 +139,7 @@ clients share one bucket). The bundled TLS profile sets this for you.
 **Discord bot & tickets** (see **[Tickets & the Discord bot](itsm.md)** for the full
 operator setup walkthrough — creating the Discord application, the two privileged intents,
 and both enrollment paths). Tickets themselves need none of this: the ticket store,
-lifecycle service and sweeper always run, and the dashboard's Tickets tab and `/api/tickets`
+lifecycle service and sweeper always run, and the dashboard's Inbox and `/api/tickets`
 work with nothing configured here. These keys only decide whether a Discord bot is also
 connected, install the optional dependency first: `pip install -e ".[discord]"`.
 
@@ -154,16 +154,19 @@ connected, install the optional dependency first: `pip install -e ".[discord]"`.
 | `KENNY_DISCORD_MODEL` | — | Anthropic model id for the Discord surface; empty falls back to `KENNY_CHAT_MODEL`. |
 | `KENNY_DISCORD_MAX_TURNS_PER_TICKET` | `40` | Autonomous turn cap per ticket before it is handed to an operator. Ticket-wide (any turn on the ticket, from Discord or the dashboard's ticket chat), except an operator+-driven turn from either surface never counts against it. |
 | `KENNY_DISCORD_RATE_LIMIT_PER_USER_HOUR` | `20` | Per-account throttle on opening/driving tickets, ticket-wide across both surfaces; `0` = unlimited. An operator+-driven turn, from either surface, is exempt. |
-| `KENNY_DISCORD_WEBHOOK_URL` | — | Discord incoming-webhook URL for the alert push channel — independent of the bot; see [Alerting & digests](alerting.md#notification-channels). |
+| `KENNY_DISCORD_WEBHOOK_URL` | — | Discord incoming-webhook URL for the alert push channel — independent of the bot. Also editable in Admin → Alerting & Digest; see [Alerting & digests](alerting.md#notification-channels). |
 | `KENNY_TICKET_APPROVAL_TTL_SECS` | `86400` | How long a held approval/consent waits for a decision before the sweeper expires it (an expiry counts as a denial); `0` never expires. |
 | `KENNY_TICKET_AUTOCLOSE_SECS` | `172800` | Reopen window: a `resolved` ticket untouched this long is auto-closed; `0` disables. |
 | `KENNY_TICKET_SWEEP_INTERVAL_SECS` | `300` | Ticket housekeeping loop interval (expires gates, auto-closes); `0` disables (restart to re-enable). Re-read live. |
 | `KENNY_TICKET_SWEEP_INITIAL_DELAY` | `30` | Delay before the first sweep after startup. |
 | `KENNY_TICKET_RETENTION_DAYS` | `30` | How long a **closed** ticket keeps its raw working transcript. The ticket, its summary and its audit trail are never pruned. |
+| `KENNY_TRIAGE_ENABLED` | `1` | On a new ticket, run one read-only investigation on its PC and write the finding into the ticket before anyone is asked to look. Needs `ANTHROPIC_API_KEY`; without one it stays off whatever this says. See [Tickets → kenny looks first](itsm.md#kenny-looks-first-before-you-are-asked-to). |
+| `KENNY_TRIAGE_RESOLVE` | `0` | Let an investigation set a ticket to `resolved` itself — only for an alert-opened ticket, only on a closing verdict, and only when a read-only check actually ran and succeeded. Off means every verdict is a recommendation. |
+| `KENNY_TRIAGE_MAX_ITERATIONS` | `8` | Model round-trips one investigation may take. Spending them all produces no verdict: the ticket stays open with what was found. |
 
 Everything above except the bot token and the webhook URL (secrets, env-only) is also
-editable from the dashboard's **Settings** tab, under the **Discord & Tickets** group — most
-apply immediately, and `KENNY_DISCORD_ENABLED`/`KENNY_DISCORD_GUILD_IDS`/
+editable from the dashboard's **[Admin](dashboard.md#admin) → Discord & Tickets** section —
+most apply immediately, and `KENNY_DISCORD_ENABLED`/`KENNY_DISCORD_GUILD_IDS`/
 `KENNY_TICKET_SWEEP_INITIAL_DELAY` need a restart, exactly like the other loop-startup
 settings on this page.
 
@@ -208,8 +211,9 @@ relative double-clicks `setup.bat`; the agent self-elevates and installs itself 
 `%ProgramFiles%\kenny` (see
 [`adr/0030-agent-self-elevating-bootstrap-installer.md`](adr/0030-agent-self-elevating-bootstrap-installer.md)).
 
-The **Add a PC** panel has an OS selector. For a **Linux** target, point the server at a Linux
-binary as well and the panel produces a one-line install command instead of a ZIP (see
+The **Add a PC** wizard's second step asks for the target OS. For a **Linux** target, point
+the server at a Linux binary as well and the wizard's hand-over step produces a one-line
+install command instead of a ZIP (see
 [Installing the agent on Linux](#installing-the-agent-on-linux) and
 [`adr/0034-linux-agent-distribution-convenience-script.md`](adr/0034-linux-agent-distribution-convenience-script.md)):
 
@@ -223,21 +227,31 @@ environment:
 
 To avoid the first-agent chicken-and-egg (hand-placing the `.exe` into the volume before any
 installer can be downloaded), the server can fetch the binary itself when a GitHub token is
-configured (ADR-0015):
+configured (ADR-0015). No credential is involved — releases are read anonymously (ADR-0057):
 
 ```yaml
 environment:
-  KENNY_GITHUB_TOKEN: ${KENNY_GITHUB_TOKEN}   # a token with read access to releases
-  KENNY_GITHUB_REPO: t11z/kenny               # default
+  KENNY_GITHUB_REPO: nullthrone/kenny         # default
 ```
 
 On startup (and via the dashboard's **retry GitHub fetch** button) the server downloads the latest
 release's agent binaries — `kenny-agent-<tag>-x86_64-pc-windows-msvc.exe` and the Linux
 `…-<arch>-unknown-linux-musl` variants — verifies each against its published `.sha256`, and caches
 them on the `/data` volume. The fetch is **best-effort** and per-asset — if the repo is unreachable
-or no token is set, the dashboard shows a banner with manual instructions instead. Operator-placed
+the dashboard shows a banner with manual instructions instead. Operator-placed
 `KENNY_AGENT_BINARY` / `KENNY_AGENT_BINARY_LINUX` always win over the fetched cache. The dashboard's
-**Add a PC** control lets you onboard the very first machine without a pre-existing agent.
+**Add a PC** wizard lets you onboard the very first machine without a pre-existing agent.
+
+Best-effort does not mean quiet. Every attempt is recorded, including the one branch that decides not
+to fetch at all (an operator-placed binary taking precedence), and the outcome survives a restart.
+**About kenny** shows it on the *staged agent version* row and Fleet's banner repeats it, so a stale
+staged version always comes with the reason it stopped moving.
+
+Two failures are worth recognising by name. A **403** is either GitHub's rate limiter or a refusal;
+the dashboard says which, and for the limiter it names the reset time. Because reads are anonymous
+the limit is 60 requests per hour **per IP**, shared with anything else behind the same address —
+kenny's own draw is a fraction of that. A **404** means the repo is not public: auto-fetch cannot
+reach a private release repo at all, and that deployment needs `KENNY_AGENT_BINARY` placed by hand.
 
 ## Installing the agent on Windows
 
@@ -274,8 +288,9 @@ kenny-agent runs on Linux hosts too — headless servers, a NAS, a Raspberry Pi,
 binary** with no runtime dependencies, installed as a **systemd service**. Distribution follows the
 Docker/K3s convenience-script model (ADR-0034).
 
-The normal path is the dashboard's **one-line install command**. In **Add a PC**, pick *Linux*,
-enter an agent id, and copy the command it produces — then run it on the target host as root:
+The normal path is the dashboard's **one-line install command**. In the **Add a PC** wizard,
+name the machine, pick *Linux*, and copy the command its hand-over step produces — then run
+it on the target host as root:
 
 ```bash
 curl -fsSL https://kenny.example.com/d/install/<nonce> | sudo sh
@@ -295,7 +310,7 @@ journalctl -u kenny-agent -f          # follow the agent log
 
 The single binary manages its own service. For a manual / air-gapped install, download
 `kenny-agent-<tag>-<arch>-unknown-linux-musl` from the
-[latest release](https://github.com/t11z/kenny/releases/latest), then (as root):
+[latest release](https://github.com/nullthrone/kenny/releases/latest), then (as root):
 
 ```bash
 chmod +x kenny-agent-*-unknown-linux-musl
@@ -343,8 +358,8 @@ flowchart LR
   attached to the Release. The x86_64 build is e2e-gated before publish.
 - Pull the release binaries to the host and point `KENNY_AGENT_BINARY` (Windows) and
   `KENNY_AGENT_BINARY_LINUX` / `KENNY_AGENT_BINARY_LINUX_AARCH64` (Linux) at them to enable GUI
-  downloads/updates against that version. When `KENNY_GITHUB_TOKEN` is set the server auto-fetches
-  all of them.
+  downloads/updates against that version — only needed for a private repo, since the server
+  auto-fetches all of them from a public one on its own.
 
 ### Dev channel (ADR-0048)
 
@@ -389,7 +404,7 @@ is wired but off by default:
 - **Data**: the SQLite telemetry store lives on the `kenny-data` volume (`/data`). Telemetry
   snapshots auto-prune after ~30 days.
 - **Backups**: kenny has a built-in backup manager ([ADR-0039](adr/0039-server-database-backup-and-restore.md),
-  dashboard **Settings → Backup** section, superuser only) — do **not** point an external
+  dashboard **Admin → Backup** section, superuser only) — do **not** point an external
   sync/backup tool at `kenny.sqlite` directly; syncing the *live* WAL file causes lock
   contention. Instead, on a schedule (`KENNY_BACKUP_INTERVAL_SECS`, default 6 h) or on
   demand, it writes a consistent `VACUUM INTO` snapshot to `<KENNY_DB_PATH dir>/backups/` —
@@ -398,18 +413,18 @@ is wired but off by default:
   target too, configured from the same section. Restore stages a chosen backup and restarts
   the server to apply it (see the [Backup section reference](dashboard.md#backup)).
 - **Server upgrade**: `docker compose pull && docker compose up -d` (or bump the image tag). The
-  **Settings → Updates** section (below) tells you when a newer tag exists and gives you the
+  **Admin → Updates** section (below) tells you when a newer tag exists and gives you the
   exact, digest-pinned command — it never pulls or restarts the container for you.
 - **Agent upgrade**: click **update** on one agent in the dashboard (server-triggered
   self-update, unchanged) — or approve a fleet-wide **update campaign** from the
-  **Settings → Updates** section to roll a pinned version out to every agent, on both
+  **Admin → Updates** section to roll a pinned version out to every agent, on both
   Windows and Linux (ADR-0034, ADR-0040).
 
 ### Scheduled updates (ADR-0040)
 
 kenny checks for newer agent releases (GitHub Releases) and a newer server image (GHCR tags,
-read-only) on a schedule, and surfaces both from the dashboard's **Updates** page (operator role
-or higher). Detection never applies anything by itself:
+read-only) on a schedule, and surfaces both from the dashboard's **Admin → Updates** section
+(operator role or higher). Detection never applies anything by itself:
 
 - **Server**: GHCR is polled for a newer semver tag than the one running; the page shows it with
   the exact, digest-pinned `docker pull …@sha256:… && docker compose up -d` for you to run. A
@@ -430,7 +445,7 @@ or higher). Detection never applies anything by itself:
 |----------|---------|---------|
 | `KENNY_UPDATE_CHECK_INTERVAL_SECS` | `86400` (24 h) | Scheduled update-check loop interval; `0` disables (restart to re-enable). Re-read live. |
 | `KENNY_UPDATE_CHECK_INITIAL_DELAY` | `30` | Delay before the first check after startup. |
-| `KENNY_SERVER_IMAGE_REF` | `ghcr.io/t11z/kenny-server` | GHCR image polled for a newer server tag. |
+| `KENNY_SERVER_IMAGE_REF` | `ghcr.io/nullthrone/kenny-server` | GHCR image polled for a newer server tag. |
 | `KENNY_AGENT_ROLLOUT_ON_CONNECT` | `0` | Auto-apply an active, approved campaign to agents as they connect. Off by default — a campaign must still be approved first either way. |
 | `KENNY_UPDATE_CAMPAIGN_MAX_AGE_SECS` | `1209600` (14 d) | A campaign auto-expires after this long even if not every agent was reached. |
 

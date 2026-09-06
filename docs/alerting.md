@@ -21,16 +21,29 @@ not on every push:
 - **A recovery is only announced if the degrading episode was itself announced.** An
   improvement that nobody was told about stays silent, and `crit→warn` updates state
   quietly.
+- **Posture never notifies.** A section in the `posture` tier (an unencrypted drive, a
+  remote-access port, idle updater services — see the status model in
+  [telemetry.md](telemetry.md#status-model)) is a standing fact, not an event: every
+  transition into or out of it only updates state, which is what gives the finding its
+  age on the host page. It is listed once a week in the digest's `Posture:` line.
+- **The body is the finding, not the transition.** A line reads
+  `[CRIT] disk: C: 97% full (>=95%)` and a recovery `[RESOLVED] disk: C: 50% full`; the
+  title names the worst escalated section's reason. The `ok -> crit` bookkeeping stays
+  on the Log page.
 
 The persisted flap-suppression state means a server restart never re-fires alerts for
 conditions that were already notified.
 
-!!! note "Reliability alarm suppression also dampens this loop"
-    An operator-suppressed reliability event pattern (ADR-0041, issue #166) is excluded from
-    the `reliability` section's severity scoring wherever that scoring runs — including this
-    push-alert loop and the weekly digest below, not just the dashboard. Muting a known-noisy
-    Windows quirk (e.g. a `CryptSvc` pattern rotating hundreds of times a day) stops it from
-    triggering push notifications too. See [Alarm suppression](telemetry.md#alarm-suppression).
+!!! note "This loop scores reliability exactly like the dashboard"
+    The `reliability` section is scored on whether each event pattern is still happening
+    and on the severity the categorizer assigned it — never on raw volume — and the
+    categorizer's verdicts are persisted and stamped onto every snapshot read (ADR-0058).
+    So the alert loop, the weekly digest below, the fleet list and the dashboard all reach
+    one verdict per host: a reboot storm that wrote 80 identical errors a week ago never
+    pages anyone, and a pattern firing every day does. An operator-suppressed pattern
+    (ADR-0041) is excluded from that scoring everywhere it runs. See the `reliability` row
+    in [telemetry.md](telemetry.md#telemetry-sections) and
+    [Alarm suppression](telemetry.md#alarm-suppression).
 
 !!! note "Offline detection is push-derived"
     An agent counts as **offline** when its newest snapshot is older than the offline
@@ -41,12 +54,12 @@ conditions that were already notified.
     `KENNY_ALERT_INTERVAL_SECS=0` if that is noise for your fleet.
 
 Every emitted alert is also written to the **events table** (`kind='alert'`) as an audit
-trail and as the weekly digest's input, so it shows up in the dashboard's **Activity →
-events & logs** view with no extra UI plumbing.
+trail and as the weekly digest's input, so it shows up in the dashboard's **[Log](dashboard.md#log)**
+page with no extra UI plumbing.
 
 <figure markdown>
-![Emitted alerts and server/agent events in the Activity events and logs view.](assets/screenshots/activity-events.png)
-<figcaption>Emitted alerts and server/agent events in the Activity → events & logs view.</figcaption>
+![Emitted alerts and server/agent events in the Log page.](assets/screenshots/log.png)
+<figcaption>Emitted alerts and server/agent events in the Log page, filterable by the ALERTS and EVENTS chips.</figcaption>
 </figure>
 
 ## An alert can open a ticket
@@ -60,8 +73,8 @@ side effect make an alert late or lost — alerting must not become less reliabl
 one.
 
 An alert-origin ticket has **no requester** — it belongs to the fleet, not a person — so it
-is operator-only in the [Tickets tab](dashboard.md#the-tickets-tab): a scoped `user` never
-sees it. It starts life pinned to the alerting agent, at `high` priority for a `high`/`urgent`
+is operator-only in the [Inbox](dashboard.md#inbox): a scoped `user` never sees it. It
+starts life pinned to the alerting agent, at `high` priority for a `high`/`urgent`
 notification and `normal` otherwise, with the alert's own message as its opening summary.
 
 ### Which events open a ticket is configurable
@@ -69,7 +82,7 @@ notification and `normal` otherwise, with the alert's own message as its opening
 By default, every genuine alert — a health escalation, an agent going offline, a disk-fill
 forecast — opens a ticket, and a recovery, an inventory change, and the weekly digest never
 do. An operator can narrow or widen that per fleet or per host from the **Auto-ticket
-rules** section of [Settings](dashboard.md#auto-ticket-rules), or via the `ticket_rule_*`
+rules** section of [Admin](dashboard.md#auto-ticket-rules), or via the `ticket_rule_*`
 MCP tools. Each rule names an event type (`health` / `offline` / `disk_forecast` /
 `change`), an optional section and host, and a decision: `open_all` (always), `open_crit`
 (only when the subject is `crit`) or `never`.
@@ -119,14 +132,14 @@ points, a genuinely rising slope and a decent fit (r² ≥ 0.5), else they retur
 rather than a scary made-up number:
 
 - **Disk-fill forecast** — *days until full* per volume. Under **~14 days** raises an
-  alert (re-firing at most every 24 h); under **~30 days** shows as an Overview KPI and in
+  alert (re-firing at most every 24 h); under **~30 days** shows as a Today KPI and in
   the weekly digest.
 - **Battery drift** — health change as **percent per 30 days**; a meaningful decline
   appears in the digest.
 
-These same computations feed the per-agent **AI Forecast** card at the top of the agent
-drill-down, which synthesizes them (with the inventory diff) into a short prose outlook —
-see [`dashboard.md`](dashboard.md).
+These same computations feed the per-host **Forecast** panel at the top of
+[the host page](dashboard.md#the-host-page), which synthesizes them (with the inventory
+diff) into a short prose outlook.
 
 ## Weekly digest
 
@@ -147,11 +160,21 @@ time.
 Delivery goes through three best-effort channels, **all off unless configured** (a single
 HTTP POST each):
 
-| Channel | Configure with | Payload |
-|---------|----------------|---------|
+| Channel | Setting | Payload |
+|---------|---------|---------|
 | **ntfy** | `KENNY_NTFY_URL` (+ optional `KENNY_NTFY_TOKEN` bearer) | POST body to an ntfy topic; title/priority/tags as headers — works out of the box with the ntfy phone apps |
 | **Generic webhook** | `KENNY_WEBHOOK_URL` | JSON POST (`kind`, `title`, `body`, `priority`, `tags`, `agent_id`, `event_type`, `sections`, `at`) |
 | **Discord** | `KENNY_DISCORD_WEBHOOK_URL` | JSON POST of a Discord embed — title, body as the description, priority as the embed colour, and `kind` / `agent_id` as fields |
+
+Set them in **Admin → Alerting & Digest**, or in the environment. A value saved in the
+dashboard wins over the environment and takes effect on the next alert, with no restart.
+Clearing the field turns the channel off — it does not fall back to the environment value,
+because a field an operator has just emptied should not keep delivering. Resetting the row
+to its default is what hands control back to the environment.
+
+The values are write-only in the dashboard: a saved token or webhook URL is never read
+back, only replaced. A webhook URL is bearer-equivalent — whoever holds it can receive
+your alerts — so treat it as a secret in either location (ADR-0054).
 
 Delivery is strictly best-effort: send errors are logged and swallowed, a dead target
 never stalls or kills the loop. **With no channel configured, evaluation still runs and
@@ -159,7 +182,8 @@ records alert history — it just pushes nothing.**
 
 ## Configuration
 
-Alerting environment variables (see [`setup.md`](setup.md) for the full list):
+The four channel keys below are editable in **Admin → Alerting & Digest**; the rest are
+read at startup and need a restart. See [`setup.md`](setup.md) for the full list.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -177,7 +201,7 @@ Alerting environment variables (see [`setup.md`](setup.md) for the full list):
 ## See also
 
 - [`setup.md`](setup.md) — hosting, TLS, and the full environment-variable list
-- [`dashboard.md`](dashboard.md) — the Overview KPIs and the per-agent AI Forecast card
+- [`dashboard.md`](dashboard.md) — the Today KPIs and the per-host Forecast panel
 - [`telemetry.md`](telemetry.md) — the sections and health rules these alerts evaluate
 - [`itsm.md`](itsm.md) — tickets, the Discord bot, and what an alert-opened ticket looks like
 - [ADR-0027](adr/0027-push-alerting-ntfy-webhook-and-weekly-digest.md) — push alerting & weekly digest

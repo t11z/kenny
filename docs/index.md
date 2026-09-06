@@ -1,15 +1,18 @@
-# 🐕 kenny
+# kenny
 
-**Self-hosted remote administration _and fleet monitoring_ for Windows PCs, driven by
+**Self-hosted remote administration _and fleet monitoring_ for Windows and Linux, driven by
 Claude (MCP) and a web dashboard.**
 
-kenny started as a way to look after the family's Windows PCs — keep an eye on disk space and
-Defender, fix things over the phone without "can you read me what it says" — operated through
-Claude instead of a clunky console. It works for any small fleet you administer with consent.
+kenny administers a small fleet of Windows and Linux machines from one place: pushed telemetry
+with server-side health rules and alerting, capability tools that act on a host, account
+governance, a web filter and screen time, and a ticket queue the people who use those machines
+can open themselves. Operate it through Claude over MCP, through the built-in chat, or by hand
+in the console. It is for the machines **you** administer, with the consent of the people who
+use them — family PCs, a home lab, a small office.
 
 <figure markdown>
-  ![The kenny fleet console](assets/screenshots/overview.png)
-  <figcaption>The fleet console — a high-level overview with drill-down into every host. See the <a href="dashboard.md">dashboard reference</a> for the full tour.</figcaption>
+  ![The Today page](assets/screenshots/today.png)
+  <figcaption>The Today page — the fleet in one sentence, with the items that need attention ranked by consequence. See the <a href="dashboard/">dashboard reference</a> for the full tour.</figcaption>
 </figure>
 
 ```mermaid
@@ -22,7 +25,7 @@ flowchart LR
     Tunnel["Agent tunnel /agent/ws"]
     Store[("Telemetry store<br/>SQLite")]
   end
-  Agent["kenny-agent (Windows PC)<br/>PowerShell · Win32 · winget<br/>filesystem · screenshot · collectors"]
+  Agent["kenny-agent (Windows / Linux host)<br/>PowerShell / shell · winget · systemd<br/>filesystem · screenshot · collectors"]
 
   Operator -->|https dashboard + chat| UI
   Operator --> Claude -->|MCP, OAuth| MCP
@@ -35,8 +38,9 @@ flowchart LR
 
 - **kenny-server** (Python / FastMCP) — MCP endpoint for Claude, the agent tunnel, the
   telemetry store (SQLite), and the operator dashboard. One ASGI app, one port.
-- **kenny-agent** (Rust, single binary) — runs on each Windows PC, dials **out** to the server
-  (NAT/firewall friendly), executes tool calls in the user's session, and pushes health snapshots.
+- **kenny-agent** (Rust, single binary) — runs on each managed host, Windows or Linux, dials
+  **out** to the server (NAT/firewall friendly), executes tool calls in the user's session,
+  and pushes health snapshots.
 
 ## Where to next
 
@@ -64,9 +68,9 @@ flowchart LR
 
 ## Contributing
 
-kenny is open source under **[AGPL-3.0-only](https://github.com/t11z/kenny/blob/main/LICENSE)**.
-See **[CONTRIBUTING](https://github.com/t11z/kenny/blob/main/CONTRIBUTING.md)**,
-the **[Code of Conduct](https://github.com/t11z/kenny/blob/main/CODE_OF_CONDUCT.md)**, and the
-**[Security policy](https://github.com/t11z/kenny/blob/main/SECURITY.md)** (report
+kenny is open source under **[AGPL-3.0-only](https://github.com/nullthrone/kenny/blob/main/LICENSE)**.
+See **[CONTRIBUTING](https://github.com/nullthrone/kenny/blob/main/CONTRIBUTING.md)**,
+the **[Code of Conduct](https://github.com/nullthrone/kenny/blob/main/CODE_OF_CONDUCT.md)**, and the
+**[Security policy](https://github.com/nullthrone/kenny/blob/main/SECURITY.md)** (report
 vulnerabilities privately). Questions and ideas go to
-**[Discussions](https://github.com/t11z/kenny/discussions)**.
+**[Discussions](https://github.com/nullthrone/kenny/discussions)**.

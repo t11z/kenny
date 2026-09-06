@@ -56,7 +56,7 @@ jobs:
         with:
           app-id: ${{ secrets.KENNY_APP_ID }}
           private-key: ${{ secrets.KENNY_APP_PRIVATE_KEY }}
-      - uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+      - uses: anthropics/claude-code-action@833fb0f8c9f6686b33d963a8bae0a94f4936ab2a # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
@@ -95,7 +95,7 @@ jobs:
             5. Look for likely duplicates (`gh issue list --search ...`) and, if found, link them
                in your comment.
             6. Post a brief, welcoming first-response comment with relevant docs links
-               (https://t11z.github.io/kenny/ , docs/setup.md, docs/user-guide.md). Keep it short.
+               (https://nullthrone.github.io/kenny/ , docs/setup.md, docs/user-guide.md). Keep it short.
             7. Close ONLY if the issue is obvious spam or empty (`gh issue close` with a polite
                note). When unsure, never close — leave it for a human.
 
@@ -130,7 +130,7 @@ jobs:
         with:
           app-id: ${{ secrets.KENNY_APP_ID }}
           private-key: ${{ secrets.KENNY_APP_PRIVATE_KEY }}
-      - uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+      - uses: anthropics/claude-code-action@833fb0f8c9f6686b33d963a8bae0a94f4936ab2a # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}

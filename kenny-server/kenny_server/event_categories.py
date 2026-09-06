@@ -30,12 +30,22 @@ fails outright backs off for a short cooldown so a persistently broken API
 doesn't get re-hit on every single request. Concurrent callers racing over the
 same uncached keys (e.g. ``api_fleet_overview`` and ``api_agent``) ride along
 on one in-flight batch instead of firing duplicate calls.
+
+Since ADR-0058 the cache is **durable**: every verdict is written through to
+:class:`kenny_server.store.EventClassificationStore` and loaded back at boot
+(``bind_store`` / ``load_persisted``), and :func:`mark` stamps verdicts from
+the cache alone -- synchronously, no LLM, no key -- so it can sit on the
+``TelemetryStore.annotate`` seam next to suppression and reach *every* health
+consumer (alerting, the digest, the fleet list, MCP), not just the two
+dashboard reads. Cache misses are filled by :func:`schedule_classification`,
+kicked fire-and-forget at telemetry insert; ingestion never waits for it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections import OrderedDict
@@ -53,12 +63,21 @@ __all__ = [
     "categorize_events",
     "annotate_events",
     "annotate_snapshots",
+    "bind_store",
     "default_client",
+    "load_persisted",
+    "mark",
+    "reset_state",
+    "schedule_classification",
 ]
+
+logger = logging.getLogger("kenny.event_categories")
 
 CATEGORIZE_MODEL = "claude-haiku-4-5"
 _MAX_TOKENS = 512
-_CACHE_MAX = 512
+# Bounds the in-memory mirror of the persisted table. A real fleet has a few
+# hundred distinct (source, event_id) patterns at most.
+_CACHE_MAX = 4096
 # How long a read may block on classification before falling back to the safe
 # defaults for this response (the batch keeps running in the background — see
 # module docstring). 1.5s is comfortably above a warm-cache no-op (0ms) and a
@@ -163,6 +182,82 @@ def _cache_put(key: tuple[str, int], value: Classification) -> None:
         _cache.popitem(last=False)
 
 
+# -- persistence (ADR-0058) ------------------------------------------------
+
+# The durable home of the cache. ``None`` (tests, or a caller that never
+# bound one) keeps the pre-0058 in-memory-only behaviour.
+_store: Any = None
+
+
+def reset_state() -> None:
+    """Forget every cached, in-flight and backing-off classification.
+
+    The cache, the in-flight map and the failure backoff are module state
+    shared by every ``build_app`` in one process; a test that leaves a key
+    backing off after a deliberately broken client would otherwise keep the
+    next test's classification of the same pattern from ever starting.
+    """
+
+    _cache.clear()
+    _inflight.clear()
+    _failed_until.clear()
+
+
+def bind_store(store: Any) -> None:
+    """Attach the :class:`~kenny_server.store.EventClassificationStore` that
+    verdicts are written through to and loaded from."""
+
+    global _store
+    _store = store
+
+
+async def load_persisted() -> int:
+    """Fill the cache from the bound store (call once at startup, after the
+    store is connected). Rows from a different ``CATEGORIZE_MODEL`` are
+    dropped first so a model upgrade re-classifies instead of serving stale
+    verdicts. Returns the number of classifications loaded."""
+
+    if _store is None:
+        return 0
+    await _store.delete_model_except(CATEGORIZE_MODEL)
+    rows = await _store.list()
+    for r in rows:
+        _cache_put(
+            _key(r.get("source"), r.get("event_id")),
+            {
+                "category": r["category"] if r.get("category") in _CATEGORY_SET else FALLBACK,
+                "severity": (
+                    r["severity"] if r.get("severity") in _SEVERITY_SET else SEVERITY_FALLBACK
+                ),
+                "cause": str(r.get("cause") or ""),
+            },
+        )
+    return len(rows)
+
+
+async def _persist(items: list[tuple[tuple[str, int], Classification]]) -> None:
+    """Best-effort write-through; a store hiccup never fails a classification."""
+
+    if _store is None or not items:
+        return
+    try:
+        await _store.upsert_many(
+            [
+                {
+                    "source": key[0],
+                    "event_id": key[1],
+                    "category": c["category"],
+                    "severity": c["severity"],
+                    "cause": c["cause"],
+                    "model": CATEGORIZE_MODEL,
+                }
+                for key, c in items
+            ]
+        )
+    except Exception:  # noqa: BLE001 - persistence is an optimization, not a dependency
+        logger.exception("persisting %d event classification(s) failed", len(items))
+
+
 # -- LLM call -------------------------------------------------------------
 
 
@@ -261,8 +356,11 @@ def _start_classify_task(
                 for key in keys:
                     _failed_until[key] = until
                 return
+            landed: list[tuple[tuple[str, int], Classification]] = []
             for (key, _), classification in zip(todo, classifications):
                 _cache_put(key, classification)
+                landed.append((key, classification))
+            await _persist(landed)
         finally:
             for key in keys:
                 if _inflight.get(key) is task:
@@ -352,6 +450,71 @@ def annotate_events(
             e["category"] = info["category"]
             e["severity"] = info["severity"]
             e["suspected_cause"] = info["cause"]
+
+
+def _reliability_events(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rel = snapshot.get("reliability") if isinstance(snapshot, dict) else None
+    if not isinstance(rel, dict):
+        return []
+    events = rel.get("events")
+    return [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
+
+
+def mark(agent_id: str, snapshot: dict[str, Any] | None) -> None:
+    """Stamp ``category``/``severity``/``suspected_cause`` onto each reliability
+    event group in ``snapshot`` from the cache alone -- synchronous, no LLM, no
+    API key -- for the ``TelemetryStore.annotate`` seam (ADR-0058).
+
+    A group whose pattern is not cached yet is left **unstamped** (the health
+    rule then treats it as ``unknown``), never stamped with the fallback: the
+    fallback would be indistinguishable from a real "unknown" verdict, and a
+    later :func:`annotate_snapshots` on the same dict must still see that the
+    pattern needs classifying. ``suppressed``/``suppressed_by`` (ADR-0041) are
+    never touched.
+    """
+
+    for e in _reliability_events(snapshot):
+        info = _cache.get(_key(e.get("source"), e.get("event_id")))
+        if info is None:
+            continue
+        e["category"] = info["category"]
+        e["severity"] = info["severity"]
+        e["suspected_cause"] = info["cause"]
+
+
+def schedule_classification(
+    agent_id: str,
+    snapshot: dict[str, Any] | None,
+    *,
+    client_factory: Callable[[], Any] | None = None,
+) -> bool:
+    """Kick one background batch for every uncached reliability pattern in
+    ``snapshot`` and return immediately (fire-and-forget) -- the telemetry
+    insert path's hook, so the alert loop finds a warm cache on its next pass
+    without any read having paid for the classify call. Honors the in-flight
+    and failure-backoff maps like :func:`categorize_events`; does nothing
+    without an API key. Returns whether a batch was started. Must be called
+    from within a running event loop.
+    """
+
+    if not ai_available():
+        return False
+    now = time.monotonic()
+    todo: list[tuple[tuple[str, int], dict[str, Any]]] = []
+    seen: set[tuple[str, int]] = set()
+    for e in _reliability_events(snapshot):
+        key = _key(e.get("source"), e.get("event_id"))
+        if key in _cache or key in _inflight or key in seen:
+            continue
+        if _failed_until.get(key, 0.0) > now:
+            continue
+        seen.add(key)
+        todo.append((key, e))
+    if not todo:
+        return False
+    factory = client_factory or default_client
+    _start_classify_task(factory(), todo)
+    return True
 
 
 @lru_cache(maxsize=1)

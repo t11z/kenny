@@ -18,6 +18,8 @@ import asyncio
 import contextlib
 import logging
 import os
+from datetime import datetime, timezone
+from functools import partial
 from typing import Any, AsyncIterator
 
 from fastmcp import FastMCP
@@ -25,7 +27,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.routing import Mount, Route, WebSocketRoute
 
-from . import agent_release
+from . import agent_release, event_categories
 from .alerting import AlertEngine
 from .config import Settings
 from .auth import (
@@ -42,7 +44,7 @@ from .discord_service import SLASH_COMMANDS, DiscordService
 from .distribution import ShareLinks, build_download_routes
 from .keystore import KeyStore
 from .logging_config import StoreLogHandler, configure_logging, drain_log_queue
-from .notify import Notification, load_notifiers
+from .notify import Notification, NotifierProvider
 from .oauth import build_oauth_routes
 from .oauthstore import OAuthStore
 from .policy import PolicyEngine
@@ -52,6 +54,7 @@ from .store import (
     AlertStateStore,
     BackupTargetStore,
     ChatHistoryStore,
+    EventClassificationStore,
     EventStore,
     PolicyStore,
     ReliabilitySuppressionStore,
@@ -64,16 +67,19 @@ from .store import (
 from .ticket_assistant import TicketAssistant
 from .ticket_rules import TicketRuleList
 from .ticketstore import TicketStore
+from .recommend import ai_available
 from .tickets import TicketService, ticket_sweep_loop
+from .triage import TriageService
 from .tokenstore import AgentTokenStore
 from .toolloop import ToolExecutor
 from .tools import CallLog, ScreenshotStore, register_tools
 from .tunnel import AgentTunnel
-from .update_manager import UpdateManager, update_check_loop
+from .update_manager import UpdateManager, record_agent_fetch, update_check_loop
 from .userstore import UserStore
 from .webfilter import ExternalListCache, WebFilterService
 from .webui import _anthropic_client, build_api_routes, build_chat_routes
 from .webui.authz import guard
+from .webui.inbox import build_inbox_routes
 from .webui.tickets import build_ticket_routes
 from .webui.users import build_user_routes
 
@@ -92,6 +98,105 @@ async def _webfilter_refresh_loop(
         # Re-read the cadence each pass so a dashboard change retimes the loop.
         interval = settings.get("KENNY_WEBFILTER_REFRESH_SECS")
         await asyncio.sleep(interval if interval and interval > 0 else interval_s)
+
+
+# Cadence of the schedule loop below. Read from the environment rather than the
+# settings catalog because the catalog is not this feature's to extend; `0`
+# disables the loop entirely, matching the other loops' restart-lifecycle gate.
+_SCHEDULE_INTERVAL_ENV = "KENNY_WEBFILTER_SCHEDULE_SECS"
+_SCHEDULE_DELAY_ENV = "KENNY_WEBFILTER_SCHEDULE_INITIAL_DELAY"
+_SCHEDULE_INTERVAL_DEFAULT = 60
+_SCHEDULE_DELAY_DEFAULT = 15.0
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, "") or default)
+    except ValueError:
+        logging.getLogger("kenny.webfilter").warning(
+            "%s is not an integer; using %d", key, default
+        )
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, "") or default)
+    except ValueError:
+        logging.getLogger("kenny.webfilter").warning(
+            "%s is not a number; using %s", key, default
+        )
+        return default
+
+
+async def webfilter_schedule_pass(
+    webfilter: WebFilterService, tunnel: AgentTunnel, call_log: CallLog
+) -> dict[str, int]:
+    """One pass of the web-filter schedule: push where now differs from applied.
+
+    For every host with an enabled schedule window whose feature and block mode
+    are both on, compare the list the schedule says applies *now* against the
+    ``applied_hash`` already on the host and forward ``webfilter_apply`` only
+    when they differ — so a pass over an unchanged fleet costs nothing on the
+    wire and re-running it is idempotent.
+
+    Every failure is contained to its host: an offline or kill-switched agent,
+    or a list that has grown past the agent's cap, is logged and skipped, never
+    retried in a tight loop and never allowed to end the pass. Returns
+    ``{pushed, failed, skipped}`` for the caller to log.
+    """
+
+    log = logging.getLogger("kenny.webfilter")
+    counts = {"pushed": 0, "failed": 0, "skipped": 0}
+    for item in await webfilter.schedule_due():
+        agent_id = item["agent_id"]
+        if item["error"] is not None:
+            counts["skipped"] += 1
+            log.error("scheduled webfilter push for %s skipped: %s", agent_id, item["error"])
+            continue
+        args = item["args"]
+        try:
+            result = await tunnel.send_request(agent_id, "webfilter_apply", args, 30)
+            await call_log.record(agent_id, "webfilter_apply", args, ok=True)
+        except Exception as exc:  # noqa: BLE001 - one host must not end the pass
+            counts["failed"] += 1
+            await call_log.record(
+                agent_id, "webfilter_apply", args, ok=False, error=str(exc)
+            )
+            log.info("scheduled webfilter push for %s failed: %s", agent_id, exc)
+            continue
+        applied_at = str(
+            result.get("applied_at") or datetime.now(timezone.utc).isoformat()
+        )
+        await webfilter.set_applied_state(
+            agent_id, args["list_hash"], applied_at, bool(result.get("ok", True))
+        )
+        counts["pushed"] += 1
+        log.info(
+            "scheduled webfilter push applied to %s (%d domains, hash %s)",
+            agent_id,
+            len(args["domains"]),
+            args["list_hash"],
+        )
+    return counts
+
+
+async def _webfilter_schedule_loop(
+    webfilter: WebFilterService,
+    tunnel: AgentTunnel,
+    call_log: CallLog,
+    interval_s: int,
+    initial_delay_s: float,
+) -> None:
+    """Periodically enact per-host web-filter schedule windows (ADR-0055)."""
+
+    await asyncio.sleep(initial_delay_s)
+    while True:
+        try:
+            await webfilter_schedule_pass(webfilter, tunnel, call_log)
+        except Exception:  # noqa: BLE001 - never let the loop die
+            logging.getLogger("kenny.webfilter").exception("schedule pass failed")
+        await asyncio.sleep(interval_s)
 
 
 async def _backup_loop(
@@ -196,7 +301,14 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
     # reliability_suppression.py.
     suppression_store = ReliabilitySuppressionStore(db_path)
     suppression = SuppressionList(suppression_store)
-    store.annotate = suppression.mark
+    # Persisted LLM event classification (ADR-0026 made durable by ADR-0058):
+    # the verdicts ride the same read-path seam as suppression, so alerting,
+    # the digest, the fleet list and MCP score reliability on the same
+    # severity the dashboard shows -- one verdict per host. Order: suppression
+    # first, classification second; the two stamp disjoint fields.
+    classification_store = EventClassificationStore(db_path)
+    event_categories.bind_store(classification_store)
+    store.annotators = [suppression.mark, event_categories.mark]
     # Auto-ticket rules (see ticket_rules.py): which alerts open a ticket is operator
     # policy, not a hardcoded predicate. Same shape as the suppression rules
     # above -- an operator-authored table + an in-memory mirror consulted
@@ -229,6 +341,10 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         policy_engine=policy_engine,
         policy_store=policy_store,
         webfilter=webfilter,
+        # Classify newly seen reliability patterns in the background right
+        # after each push lands, so the alert loop never scores an
+        # unclassified snapshot for want of a dashboard read (ADR-0058).
+        after_insert=partial(event_categories.schedule_classification, client_factory=client_factory),
     )
     call_log = CallLog(event_store=event_store)
     screenshots = ScreenshotStore()
@@ -265,6 +381,24 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
     )
     discord_identities = DiscordIdentityStore(db_path)
 
+    def alert_dedup_key(note: Notification) -> str:
+        """Name what an alert notification is *about*, for ticket deduplication.
+
+        Built from the structured discriminators the notification already
+        carries for the auto-ticket rules (``notify.Notification``) -- the host,
+        which producer raised it, and which sections it is about -- never from
+        the free-text title, which is a display string and would silently change
+        this identity whenever its wording did.
+
+        Sorted, so the same set of sections yields the same key whatever order
+        the evaluation happened to visit them in. A notification with no
+        sections (offline, disk forecast) keys on its ``event_type`` alone,
+        which is exactly its subject.
+        """
+
+        subject = "+".join(sorted(note.sections)) if note.sections else ""
+        return f"alert|{note.agent_id or ''}|{note.event_type or note.kind}|{subject}"
+
     async def open_alert_ticket(note: Notification) -> None:
         """Open the ticket an alert asks for (ADR-0027 stays best-effort).
 
@@ -272,8 +406,27 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         owner and is operator-only by the ticket API's own listing rule. The
         alerting agent is frozen as the ticket's target the same way a Discord
         requester's host is.
+
+        **One open ticket per subject.** A condition that keeps re-crossing a
+        threshold used to mint a fresh ticket every time it did, which is how a
+        four-host family fleet produced 38 alert tickets in a month and had 34
+        of them cancelled or left untouched. While a ticket for the same subject
+        is still open, the recurrence is recorded *on that ticket* instead --
+        the information is kept, the second ticket is not. A ``resolved`` ticket
+        does not suppress a new one (see ``find_open_by_dedup_key``): once
+        somebody has dealt with the condition, its return is news again.
         """
 
+        key = alert_dedup_key(note)
+        existing = await ticket_store.find_open_by_dedup_key(key)
+        if existing is not None:
+            await ticket_service.append_event(
+                existing.id,
+                kind="note",
+                actor="system",
+                summary=f"the same condition alerted again: {note.title}",
+            )
+            return
         await ticket_service.create(
             title=note.title,
             origin="alert",
@@ -284,12 +437,18 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
             summary=note.body,
             actor="system",
             reason="opened from an alert",
+            dedup_key=key,
         )
 
     # Push alerting (ADR-0027): transition detection over the health rules,
-    # delivered best-effort via the env-configured channels (possibly none).
+    # delivered best-effort on the configured channels (possibly none).
     alert_state = AlertStateStore(db_path)
-    notifiers = load_notifiers()
+    # The channels are *not* resolved here. The provider is asked again at every
+    # dispatch and reads them through ``settings`` (DB > env > default), so a
+    # channel added or cleared in the dashboard applies to the next alert
+    # without a restart (ADR-0054). Building it before ``settings.load()`` is
+    # deliberate and safe: nothing is read until the first notification.
+    notifier_provider = NotifierProvider(settings=settings)
     # Cadence/cooldown/digest are read live from ``settings`` (DB > env >
     # default) on every pass; no env snapshot is baked in here.
     alert_engine = AlertEngine(
@@ -297,7 +456,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         alert_state=alert_state,
         event_store=event_store,
         registry=registry,
-        notifiers=notifiers,
+        notifier_provider=notifier_provider,
         settings=settings,
         # (store, settings_key) pairs -- only ``store`` (snapshots) has an
         # operator-facing retention setting so far (ADR-0051): it dominates
@@ -326,22 +485,44 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
             "the ticket assistant is disabled: no usable Anthropic client (%s)", exc
         )
     ticket_assistant: TicketAssistant | None = None
+    triage: TriageService | None = None
     if ticket_client is not None:
+        ticket_executor = ToolExecutor(
+            registry=registry,
+            store=store,
+            tunnel=tunnel,
+            call_log=call_log,
+            screenshots=screenshots,
+        )
         ticket_assistant = TicketAssistant(
             tickets=ticket_service,
             users=user_store,
-            executor=ToolExecutor(
-                registry=registry,
-                store=store,
-                tunnel=tunnel,
-                call_log=call_log,
-                screenshots=screenshots,
-            ),
+            executor=ticket_executor,
             client=ticket_client,
             model=str(settings.get("KENNY_CHAT_MODEL")),
             max_turns_per_ticket=int(settings.get("KENNY_DISCORD_MAX_TURNS_PER_TICKET")),
             approval_ttl_secs=int(settings.get("KENNY_TICKET_APPROVAL_TTL_SECS")),
         )
+        # Unprompted triage rides on the same assistant and the same executor —
+        # one investigation is an ordinary ticket turn with a narrower tool set
+        # and its own prompt, not a second engine. It registers its verdict tool
+        # on the executor here rather than being handed to it, so `toolloop`
+        # keeps knowing nothing about tickets (see triage.py).
+        triage = TriageService(
+            tickets=ticket_service,
+            assistant=ticket_assistant,
+            max_iterations=int(settings.get("KENNY_TRIAGE_MAX_ITERATIONS")),
+            resolve_enabled=bool(settings.get("KENNY_TRIAGE_RESOLVE")),
+        )
+        triage.register(ticket_executor)
+        # Wired only when a key is actually configured. ``client_factory()``
+        # succeeding is not the same question: the client constructs happily
+        # without ``ANTHROPIC_API_KEY`` and only fails when it is used, so
+        # binding triage to that would fire one doomed investigation per ticket
+        # created. ``ai_available`` is the predicate the rest of the AI features
+        # already answer this with (``event_categories``, ``recommend``).
+        if ai_available() and bool(settings.get("KENNY_TRIAGE_ENABLED")):
+            ticket_service.set_triage(triage.run)
 
     # Discord bot surface (optional). The service is constructed only when a bot
     # token exists — an env-only secret, so its presence is already known here —
@@ -387,6 +568,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         call_log=call_log,
         webfilter=webfilter,
         suppression=suppression,
+        alert_state=alert_state,
         ticket_rules=ticket_rules,
     )
     # mcp_app owns "/mcp" internally and is mounted at the app root below (not
@@ -419,6 +601,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         await policy_store.connect()
         await webfilter_store.connect()
         await suppression_store.connect()
+        await classification_store.connect()
         await ticket_rule_store.connect()
         await chat_history_store.connect()
         await alert_state.connect()
@@ -450,6 +633,18 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         # Load persisted reliability suppression rules into their mirror too
         # (ADR-0041 / issue #166) -- before any health evaluation can run.
         await suppression.load()
+        # Load persisted event classifications into their mirror (ADR-0058),
+        # then kick a background batch for whatever the latest snapshots
+        # carry that is still unclassified -- so the first alert-loop pass
+        # after an upgrade scores on severity, not on the next push.
+        await event_categories.load_persisted()
+        for _agent_id in await store.known_agents():
+            _latest = await store.latest(_agent_id)
+            if _latest is not None:
+                with contextlib.suppress(Exception):
+                    event_categories.schedule_classification(
+                        _agent_id, _latest["snapshot"], client_factory=client_factory
+                    )
         # Load persisted auto-ticket rules before the alert loop
         # below can dispatch a single notification.
         await ticket_rules.load()
@@ -468,6 +663,20 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
             initial_delay = float(settings.get("KENNY_WEBFILTER_INITIAL_REFRESH_DELAY"))
             webfilter_task = asyncio.create_task(
                 _webfilter_refresh_loop(webfilter_cache, settings, refresh_secs, initial_delay)
+            )
+        # Web-filter schedule loop (ADR-0055). Only hosts that have an enabled
+        # window are ever touched, so on a fleet with no schedule this is a
+        # no-op query per pass. KENNY_WEBFILTER_SCHEDULE_SECS=0 disables it
+        # entirely (a "restart" decision, like the loops around it); the initial
+        # delay keeps short-lived test app instances from pushing anything.
+        schedule_secs = _env_int(_SCHEDULE_INTERVAL_ENV, _SCHEDULE_INTERVAL_DEFAULT)
+        schedule_task: asyncio.Task | None = None
+        if schedule_secs > 0:
+            schedule_delay = _env_float(_SCHEDULE_DELAY_ENV, _SCHEDULE_DELAY_DEFAULT)
+            schedule_task = asyncio.create_task(
+                _webfilter_schedule_loop(
+                    webfilter, tunnel, call_log, schedule_secs, schedule_delay
+                )
             )
         # Alert evaluation loop (ADR-0027). The initial delay keeps short-lived
         # test app instances silent; KENNY_ALERT_INTERVAL_SECS=0 disables.
@@ -530,18 +739,34 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         # Attach to root only: `kenny.*` records propagate up to root, so this one
         # handler captures them once (no duplicate persisted events).
         logging.getLogger().addHandler(log_handler)
-        # Best-effort: fetch the prebuilt agent binary from GitHub when configured
-        # and not overridden by an operator-placed binary (ADR-0015). Non-fatal.
-        if (
-            agent_release.github_configured()
-            and not os.environ.get("KENNY_AGENT_BINARY", "").strip()
-        ):
-            try:
+        # Best-effort: fetch the prebuilt agent binary from GitHub unless an
+        # operator-placed binary overrides it (ADR-0015). Non-fatal, and needs no
+        # credential — the read is anonymous (ADR-0057).
+        #
+        # Both branches record an outcome, the one that decides not to fetch
+        # included. A silent skip is what let a server run for weeks handing out
+        # a months-old agent with the dashboard showing only the stale version
+        # and no reason for it.
+        release_log = logging.getLogger("kenny.release")
+        try:
+            if os.environ.get("KENNY_AGENT_BINARY", "").strip():
+                result = agent_release.FetchResult(
+                    ok=True,
+                    source="manual",
+                    message=(
+                        "GitHub fetch skipped: operator-placed KENNY_AGENT_BINARY "
+                        "takes precedence"
+                    ),
+                )
+                release_log.info("agent binary fetch: %s", result.message)
+            else:
                 result = await asyncio.to_thread(agent_release.fetch_latest_agent_binary)
-                app.state.last_fetch = result
-                logging.getLogger("kenny.release").info("agent binary fetch: %s", result.message)
-            except Exception as exc:  # noqa: BLE001 - never break startup
-                logging.getLogger("kenny.release").warning("agent binary fetch failed: %s", exc)
+                log = release_log.info if result.ok else release_log.warning
+                log("agent binary fetch: %s", result.message)
+            app.state.last_fetch = result
+            await record_agent_fetch(update_store, result)
+        except Exception as exc:  # noqa: BLE001 - never break startup
+            release_log.warning("agent binary fetch failed: %s", exc)
         # Chain the MCP app's own lifespan (session manager, etc.).
         try:
             async with mcp_app.router.lifespan_context(app):
@@ -555,6 +780,10 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
                 webfilter_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await webfilter_task
+            if schedule_task is not None:
+                schedule_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await schedule_task
             if alert_task is not None:
                 alert_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -587,6 +816,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
             await policy_store.close()
             await webfilter_store.close()
             await suppression_store.close()
+            await classification_store.close()
             await ticket_rule_store.close()
             await chat_history_store.close()
             await alert_state.close()
@@ -617,6 +847,8 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         update_mgr=update_mgr,
         suppression=suppression,
         ticket_rules=ticket_rules,
+        tickets=ticket_service,
+        ticket_store=ticket_store,
     )
     user_routes = build_user_routes(
         user_store=user_store, registry=registry, store=store, oauth_store=oauth_store
@@ -662,6 +894,15 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         share_links=share_links,
         key_store=key_store,
     )
+    # The merged ticket/approval/flagged-section inbox (webui/inbox.py) --
+    # deliberately its own module and route builder, not folded into
+    # build_ticket_routes, so it stays out of webui/tickets.py entirely.
+    inbox_routes = build_inbox_routes(
+        tickets=ticket_service,
+        ticket_store=ticket_store,
+        registry=registry,
+        telemetry_store=store,
+    )
 
     # `operator_token` is the canonical single token (cookie value, tests);
     # `operator_tokens` is the full accepted set (supports KENNY_OPERATOR_TOKENS).
@@ -670,12 +911,13 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
 
     routes = [
         WebSocketRoute("/agent/ws", tunnel.endpoint),
-        *build_auth_routes(operator_tokens, user_store=user_store),
+        *build_auth_routes(operator_tokens, user_store=user_store, registry=registry),
         *build_oauth_routes(oauth_store=oauth_store, user_store=user_store),
         *chat_routes,
         *download_routes,
         *user_routes,
         *ticket_routes,
+        *inbox_routes,
         *api_routes,
         # Mounted last so it only catches what nothing above matched.
         Mount("/", app=mcp_app),
@@ -711,6 +953,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
     app.state.webfilter = webfilter
     app.state.suppression_store = suppression_store
     app.state.suppression = suppression
+    app.state.classification_store = classification_store
     app.state.ticket_rule_store = ticket_rule_store
     app.state.ticket_rules = ticket_rules
     app.state.backup_mgr = backup_mgr
@@ -732,7 +975,9 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
     # Replaced by the lifespan with the tasks it actually started (if any).
     app.state.ticket_task = None
     app.state.discord_task = None
-    app.state.notifiers = notifiers
+    # The provider, not a list: a list captured here would be a snapshot of the
+    # channels at boot and would quietly disagree with what actually delivers.
+    app.state.notifier_provider = notifier_provider
     app.state.share_links = share_links
     app.state.mcp = mcp
     app.state.operator_token = operator_token

@@ -1,7 +1,8 @@
 # kenny
 
-kenny is a self-hosted remote-admin and fleet-monitoring system for Windows PCs in a
-family setting, operated through Claude (MCP) and a web dashboard.
+kenny is a self-hosted remote-admin, fleet-monitoring and ticketing system for the Windows
+and Linux machines you administer, operated through Claude (MCP), a web dashboard, and an
+optional Discord bot.
 
 ## Language
 
@@ -31,7 +32,7 @@ the code and the commit message. Records are ~1 page, numbered gap-free `0001..N
   source of truth). Frame and tool schemas live here, nowhere else.
 - `kenny-server/` — Python/FastMCP server: MCP endpoint for Claude, agent tunnel,
   telemetry store, web dashboard. See `kenny-server/CLAUDE.md`.
-- `kenny-agent/` — Rust single-binary agent on the Windows PC. See `kenny-agent/CLAUDE.md`.
+- `kenny-agent/` — Rust single-binary agent on each managed host. See `kenny-agent/CLAUDE.md`.
 - `docs/adr/` — architecture decisions.
 - `.claude/` — subagents, slash commands, skills.
 
@@ -59,6 +60,9 @@ the code and the commit message. Records are ~1 page, numbered gap-free `0001..N
 
 ## Build & test
 
+- Dashboard: `npm --prefix kenny-web install && npm --prefix kenny-web run build` (Vite + React + TypeScript);
+  `npm --prefix kenny-web run typecheck` and `npm --prefix kenny-web test` for checks.
+  Contributors only — end users get the prebuilt UI shipped in the server.
 - Server: `cd kenny-server && pytest` — exactly that; `python -m pytest` adds the working
   directory to `sys.path` and hides import errors CI will hit.
 - Agent: `cd kenny-agent && cargo test && cargo build`

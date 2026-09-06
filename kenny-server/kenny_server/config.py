@@ -25,9 +25,14 @@ Three pieces:
   survives a restart once :meth:`Settings.load` runs.
 * ``restart``  — the consumer reads the value once, inside the app lifespan after
   :meth:`Settings.load`; an override applies on the next restart.
-* ``env_only`` — never writable from the UI (secrets, wire-contract knobs, and
-  process-bind values read before settings load). Shown read-only for
-  transparency; ``sensitive`` specs never serialise their value.
+* ``env_only`` — never writable from the UI (auth/identity secrets, wire-contract
+  knobs, and process-bind values read before settings load). Shown read-only for
+  transparency.
+
+``sensitive`` is an orthogonal axis, not a synonym for ``env_only``: it says the
+value is never serialised back out (``describe()`` reports ``set``/``not set``),
+whatever its lifecycle. The alert push channels are ``live`` *and* ``sensitive``
+— writable from the dashboard, never readable back (ADR-0054).
 
 Anything touching the agent wire contract stays ``env_only`` and is deferred to a
 future ADR (see ADR for runtime settings).
@@ -185,20 +190,25 @@ _SPECS: list[SettingSpec] = [
           "Digest day", lifecycle="live", choices=_DAYS),
     _spec("KENNY_DIGEST_HOUR", "Alerting & Digest", "int", "8",
           "Digest hour (0-23)", lifecycle="live", min=0, max=23),
-    # -- Alert push channels (env_only; read directly by notify.load_notifiers()
-    # at startup, not through Settings — advertising them as writable would be a
-    # lie about what actually takes effect). ------------------------------------
-    _spec("KENNY_NTFY_URL", "Alerting & Digest", "str", "",
-          "ntfy topic URL", lifecycle="env_only", sensitive=True,
+    # -- Alert push channels (live; resolved per dispatch by
+    # notify.NotifierProvider through this resolver, so a change applies to the
+    # next alert without a restart — ADR-0054). Every one of them is a secret:
+    # an ntfy topic URL and a webhook URL are both bearer-equivalent, so they
+    # are stored but never serialised back out (describe() reports set/not set).
+    # Clearing one here turns the channel off; it does not fall back to the
+    # environment. --------------------------------------------------------------
+    _spec("KENNY_NTFY_URL", "Alerting & Digest", "secret", "",
+          "ntfy topic URL", lifecycle="live", sensitive=True,
           help="ntfy.sh (or self-hosted) topic URL alerts are pushed to. "
-               "Treated as sensitive: a topic URL is bearer-equivalent."),
+               "Treated as sensitive: a topic URL is bearer-equivalent. "
+               "Empty means the ntfy channel is off."),
     _spec("KENNY_NTFY_TOKEN", "Alerting & Digest", "secret", "",
-          "ntfy access token", lifecycle="env_only", sensitive=True,
+          "ntfy access token", lifecycle="live", sensitive=True,
           help="Optional bearer token for an access-controlled ntfy topic."),
     _spec("KENNY_WEBHOOK_URL", "Alerting & Digest", "secret", "",
-          "Generic alert webhook URL", lifecycle="env_only", sensitive=True,
+          "Generic alert webhook URL", lifecycle="live", sensitive=True,
           help="Incoming-webhook URL alerts are POSTed to, independent of the "
-               "Discord alert webhook below."),
+               "Discord alert webhook. Empty means the channel is off."),
     # -- Web filter (live; consumed by the refresh loop / ExternalListCache) ---
     _spec("KENNY_WEBFILTER_REFRESH_SECS", "Web filter", "int", "86400",
           "External list refresh (s)", lifecycle="live", min=0,
@@ -308,10 +318,13 @@ _SPECS: list[SettingSpec] = [
                "raising 'database is locked' (ADR-0051). Read once at import "
                "time, so it cannot be changed live from the dashboard."),
     # -- Agent distribution (read-only this iteration) -------------------------
-    _spec("KENNY_GITHUB_REPO", "Agent distribution", "str", "t11z/kenny",
+    _spec("KENNY_GITHUB_REPO", "Agent distribution", "str", "nullthrone/kenny",
           "Agent GitHub repo", lifecycle="env_only"),
     _spec("KENNY_GITHUB_TOKEN", "Agent distribution", "secret", "",
-          "GitHub API token", lifecycle="env_only", sensitive=True),
+          "GHCR token", lifecycle="env_only", sensitive=True,
+          help="Only for polling a private kenny-server package on GHCR (ADR-0040). "
+               "The agent binary and the changelog are read from GitHub anonymously "
+               "(ADR-0057) and ignore this entirely."),
     _spec("KENNY_AGENT_VERSION", "Agent distribution", "str", "0.2.0",
           "Agent version", lifecycle="env_only"),
     _spec("KENNY_SERVER_VERSION", "Agent distribution", "str", "0.0.0-dev",
@@ -348,7 +361,7 @@ _SPECS: list[SettingSpec] = [
     _spec("KENNY_UPDATE_CHECK_INITIAL_DELAY", "Updates", "float", "30",
           "Initial check delay (s)", lifecycle="restart", min=0,
           help="Delay before the first update check after startup."),
-    _spec("KENNY_SERVER_IMAGE_REF", "Updates", "str", "ghcr.io/t11z/kenny-server",
+    _spec("KENNY_SERVER_IMAGE_REF", "Updates", "str", "ghcr.io/nullthrone/kenny-server",
           "Server image ref (GHCR)", lifecycle="live",
           help="GHCR repository polled (read-only, tags + manifest digest) to "
                "detect a newer server image. Never pulled or applied automatically "
@@ -373,10 +386,14 @@ _SPECS: list[SettingSpec] = [
           "Discord bot token", lifecycle="env_only", sensitive=True,
           help="Bot token of the Discord application. Managed via the "
                "environment; without it the Discord surface stays off."),
+    # The fourth alert push channel (ADR-0054): grouped with Discord because
+    # that is where an operator looks for it, but resolved per dispatch by
+    # notify.NotifierProvider exactly like the three in "Alerting & Digest".
     _spec("KENNY_DISCORD_WEBHOOK_URL", "Discord & Tickets", "secret", "",
-          "Discord alert webhook URL", lifecycle="env_only", sensitive=True,
+          "Discord alert webhook URL", lifecycle="live", sensitive=True,
           help="Incoming-webhook URL used as a push notification channel for "
-               "alerts. Independent of the bot surface."),
+               "alerts. Independent of the bot surface. Empty means the "
+               "channel is off."),
     _spec("KENNY_DISCORD_ENABLED", "Discord & Tickets", "bool", "0",
           "Discord bot enabled", lifecycle="restart",
           help="Connect the Discord bot surface at startup. Requires a bot "
@@ -415,6 +432,24 @@ _SPECS: list[SettingSpec] = [
           help="How long a held tool call waits for a decision before the "
                "sweeper expires it (an expiry counts as a denial). 0 means the "
                "gate never expires."),
+    _spec("KENNY_TRIAGE_ENABLED", "Discord & Tickets", "bool", "1",
+          "Investigate new tickets automatically", lifecycle="live",
+          help="On a new ticket, kenny runs one read-only investigation on the "
+               "host and writes what it found into the ticket, before anyone is "
+               "asked to look. Off means tickets arrive uninvestigated, as they "
+               "did before."),
+    _spec("KENNY_TRIAGE_RESOLVE", "Discord & Tickets", "bool", "0",
+          "Let triage resolve a ticket", lifecycle="live",
+          help="When an investigation both reaches a closing verdict AND can "
+               "point at a read-only check that actually ran, resolve the "
+               "ticket instead of only recommending it. Alert-opened tickets "
+               "only; a resolved ticket stays reopenable for the auto-close "
+               "window. Off means every verdict is a recommendation."),
+    _spec("KENNY_TRIAGE_MAX_ITERATIONS", "Discord & Tickets", "int", "8",
+          "Triage steps per ticket", lifecycle="live", min=1,
+          help="How many model round-trips one investigation may take. Spending "
+               "them all produces no verdict: the ticket stays open with what "
+               "was found so far."),
     _spec("KENNY_TICKET_AUTOCLOSE_SECS", "Discord & Tickets", "int", "172800",
           "Auto-close resolved after (s)", lifecycle="live", min=0,
           help="Reopen window: a resolved ticket untouched for this long is "
@@ -551,6 +586,12 @@ class Settings:
         """Grouped catalog with effective values for ``GET /api/settings``.
 
         Secrets never expose their value: they report ``is_set`` instead.
+
+        ``editable`` restates :attr:`SettingSpec.writable` on the wire so a
+        console never has to re-derive it from ``lifecycle``. It is the same
+        predicate ``PUT``/``DELETE`` enforce with a 403, read from the same
+        property, so a control that renders can always be submitted and one
+        that cannot be submitted never renders.
         """
 
         by_group: dict[str, list[dict[str, Any]]] = {g: [] for g in GROUP_ORDER}
@@ -563,6 +604,7 @@ class Settings:
                 "label": spec.label,
                 "help": spec.help,
                 "lifecycle": spec.lifecycle,
+                "editable": spec.writable,
                 "source": source,
                 "choices": list(spec.choices) if spec.choices else None,
                 "min": spec.min,
@@ -592,6 +634,7 @@ class Settings:
             "key": key,
             "source": source,
             "lifecycle": spec.lifecycle,
+            "editable": spec.writable,
         }
         if spec.sensitive:
             row["value"] = None

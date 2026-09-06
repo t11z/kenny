@@ -3,7 +3,7 @@
 Thanks for your interest in kenny! 🐕 This guide covers how to build, test, and propose
 changes. By participating you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-For questions and ideas, use [GitHub Discussions](https://github.com/t11z/kenny/discussions).
+For questions and ideas, use [GitHub Discussions](https://github.com/nullthrone/kenny/discussions).
 For **security issues, do not open a public issue** — see [SECURITY.md](SECURITY.md).
 
 ## Project layout
@@ -12,12 +12,16 @@ For **security issues, do not open a public issue** — see [SECURITY.md](SECURI
   truth). Frame and tool schemas live here, nowhere else.
 - `kenny-server/` — Python / FastMCP server (MCP endpoint, agent tunnel, telemetry store, web
   dashboard).
-- `kenny-agent/` — Rust single-binary agent for the Windows PC.
+- `kenny-agent/` — Rust single-binary agent for each managed host (Windows, Linux).
 - `docs/adr/` — architecture decisions (MADR).
 
 ## Build & test
 
 ```bash
+# Dashboard (Node.js; contributors only — end users get a prebuilt UI)
+npm --prefix kenny-web install && npm --prefix kenny-web run build
+npm --prefix kenny-web run typecheck && npm --prefix kenny-web test
+
 # Server (Python 3.11+)
 cd kenny-server && pip install -e ".[dev]" && pytest -q && ruff check .
 
@@ -28,6 +32,10 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 
 CI runs exactly these, plus a Windows job for `#[cfg(windows)]` code and a real
 agent↔server end-to-end test. Please make sure the suites are green before opening a PR.
+
+The dashboard builds from `kenny-web/` (Vite + React + TypeScript) to `kenny-server/kenny_server/webui/dist/`,
+which the server serves and which ships inside the Python package. See `docs/adr/0052-dashboard-as-a-compiled-frontend.md`
+for the rationale.
 
 ## The contract is authoritative
 

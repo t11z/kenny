@@ -7,12 +7,15 @@ scoping for the ``user`` role, and operator-only host removal.
 
 from __future__ import annotations
 
+import struct
 import time
+from pathlib import Path
 
 from starlette.testclient import TestClient
 
 from kenny_server import security
 from kenny_server.main import build_app
+from kenny_server.webui import users
 
 
 def _app(tmp_path):
@@ -188,6 +191,63 @@ def test_self_service_totp_enable_disable(tmp_path) -> None:
             "password": "pw-123456"}).json()["totp_enabled"] is False
 
 
+def test_every_credential_change_rotates_sessions(tmp_path) -> None:
+    """Password change, 2FA enable, and 2FA disable all evict other sessions
+    the same way (CWE-613), pinned together so they cannot drift apart again.
+
+    Enabling 2FA is exactly when an already-compromised session should be
+    evicted -- it is the one credential-change path that used to return
+    without rotating anything.
+    """
+
+    from kenny_server.auth import COOKIE_NAME
+
+    app = _app(tmp_path)
+    with TestClient(app) as c:
+        _setup_admin(c)
+
+        def _assert_rotates_and_keeps_this_device(act) -> None:
+            old_sid = c.cookies.get(COOKIE_NAME)
+            assert old_sid
+            act()
+            new_sid = c.cookies.get(COOKIE_NAME)
+            # This device got a fresh session and stays authorized.
+            assert new_sid and new_sid != old_sid
+            assert c.get("/api/fleet").status_code == 200
+            # The pre-change session (as held by any other device) is now
+            # rejected. Passed as a one-off request cookie rather than
+            # written into ``c``'s jar, so it can't collide with the fresh
+            # one already stored there.
+            r = c.get(
+                "/api/fleet", cookies={COOKIE_NAME: old_sid}, follow_redirects=False
+            )
+            assert r.status_code == 401
+
+        # 1. Password change.
+        _assert_rotates_and_keeps_this_device(lambda: c.post(
+            "/api/me/password",
+            json={"current_password": "pw-123456", "new_password": "pw2-123456"},
+        ))
+
+        # 2. Enable 2FA.
+        setup = c.post("/api/me/totp").json()
+        secret = setup["secret"]
+
+        def _enable() -> None:
+            code = security.totp_at(secret, time.time())
+            r = c.request(
+                "PUT", "/api/me/totp", json={"secret": secret, "code": code}
+            )
+            assert r.json()["totp_enabled"] is True
+
+        _assert_rotates_and_keeps_this_device(_enable)
+
+        # 3. Disable 2FA (password changed in step 1, so use the new one).
+        _assert_rotates_and_keeps_this_device(lambda: c.request(
+            "DELETE", "/api/me/totp", json={"password": "pw2-123456"}
+        ))
+
+
 def test_avatars_endpoint(tmp_path) -> None:
     app = _app(tmp_path)
     with TestClient(app) as c:
@@ -196,3 +256,25 @@ def test_avatars_endpoint(tmp_path) -> None:
         assert "dog-border-collie" in avatars
         # The rasterized PNG is actually served.
         assert c.get("/assets/dog-border-collie.png").status_code == 200
+
+
+def test_avatar_sources_and_rasters_match(tmp_path) -> None:
+    """Every offered avatar is an SVG source, a 128x128 PNG, and nothing else.
+
+    The PNG is derived from the SVG by hand (see webui/assets/README.md), so the
+    three can drift: an id added to AVATARS with no artwork offers a broken image
+    in the picker, and an SVG edited without re-rasterizing ships the old picture.
+    """
+    assets = Path(users.__file__).parent / "assets"
+    svgs = {p.stem for p in (assets / "avatars").glob("dog-*.svg")}
+    pngs = {p.stem for p in assets.glob("dog-*.png")}
+    assert svgs == set(users.AVATARS) == pngs
+
+    app = _app(tmp_path)
+    with TestClient(app) as c:
+        for avatar in users.AVATARS:
+            r = c.get(f"/assets/{avatar}.png")  # public: the login screen needs it
+            assert r.status_code == 200, avatar
+            # PNG signature, then IHDR's big-endian width/height.
+            assert r.content[:8] == b"\x89PNG\r\n\x1a\n", avatar
+            assert struct.unpack(">II", r.content[16:24]) == (128, 128), avatar

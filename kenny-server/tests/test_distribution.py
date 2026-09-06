@@ -6,10 +6,12 @@ import hashlib
 import io
 import json
 import zipfile
+from functools import partial
 
 import pytest
 from starlette.testclient import TestClient
 
+from kenny_server import agent_release
 from kenny_server.distribution import _install_sh, _sha256_file, agent_binary_path
 from kenny_server.main import build_app
 
@@ -203,7 +205,7 @@ def test_agent_binary_status_unavailable(tmp_path, monkeypatch):
         body = r.json()
         assert body["available"] is False
         assert body["source"] == "none"
-        assert body["github_configured"] is False
+        assert "github_configured" not in body  # the gate it reported is gone (ADR-0057)
         assert "releases/latest" in body["message"]
 
 
@@ -661,12 +663,25 @@ def test_agent_binary_status_requires_auth(tmp_path, binary):
         assert c.get("/api/agent-binary").status_code == 401
 
 
-def test_agent_binary_fetch_without_token_400(tmp_path, monkeypatch):
+def test_agent_binary_fetch_attempts_without_a_token(tmp_path, monkeypatch):
+    """No credential is a precondition any more (ADR-0057), so nothing refuses up front.
+
+    This route used to 400 without KENNY_GITHUB_TOKEN. Reads are anonymous now, so
+    the attempt is always worth making; whether it succeeds is the network's answer,
+    not a configuration check's.
+    """
+
     monkeypatch.delenv("KENNY_GITHUB_TOKEN", raising=False)
+
+    def fake_fetch(**_kwargs):
+        return agent_release.FetchResult(ok=True, source="github", message="fetched", version="9.9.9")
+
+    monkeypatch.setattr(agent_release, "fetch_latest_agent_binary", fake_fetch)
     app = _app(tmp_path)
     with TestClient(app) as c:
         r = c.post("/api/agent-binary/fetch", headers=_bearer(app))
-        assert r.status_code == 400
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
 
 
 def test_cache_served_when_no_explicit_binary(tmp_path, monkeypatch):
@@ -701,3 +716,87 @@ def test_explicit_binary_wins_over_cache(tmp_path, monkeypatch):
         assert r.status_code == 200
         zf = zipfile.ZipFile(io.BytesIO(r.content))
         assert zf.read("kenny-agent.exe") == BINARY_BYTES
+
+
+# -- the durable record of the last agent-binary refresh -----------------------
+#
+# ``last_fetch`` lives on ``app.state`` and dies with the process. That was the
+# only channel carrying *why* a refresh failed, so a restarted server showed a
+# months-old staged version with no reason attached — and the Fleet banner said
+# "no fetch has been attempted yet" while a real, repeated failure stood.
+# ``last_check`` is the same outcome read back off ADR-0040's availability row.
+
+
+def test_agent_binary_status_carries_the_durable_last_check(tmp_path, monkeypatch):
+    """A failure recorded before this process started is still reported."""
+
+    monkeypatch.delenv("KENNY_AGENT_BINARY", raising=False)
+    monkeypatch.delenv("KENNY_GITHUB_TOKEN", raising=False)
+    app = _app(tmp_path)
+    with TestClient(app) as c:
+        c.portal.call(
+            partial(
+                app.state.update_store.set_availability,
+                "agent",
+                version="2.1.0",
+                ok=False,
+                message="GitHub API 401 (token expired)",
+            )
+        )
+        body = c.get("/api/agent-binary", headers=_bearer(app)).json()
+        assert body["last_check"]["ok"] is False
+        assert body["last_check"]["message"] == "GitHub API 401 (token expired)"
+        assert body["last_check"]["version"] == "2.1.0"
+        assert body["last_check"]["checked_at"]
+
+
+def test_agent_binary_status_records_the_startup_attempt(tmp_path, monkeypatch):
+    """Startup fetches without a credential now, and records how it went.
+
+    There is no "skipped, not configured" branch left to assert (ADR-0057): the
+    attempt always happens. Here it is the suite's network guard that fails it,
+    which is exactly the shape a real unreachable GitHub would take.
+    """
+
+    monkeypatch.delenv("KENNY_AGENT_BINARY", raising=False)
+    monkeypatch.delenv("KENNY_GITHUB_TOKEN", raising=False)
+    app = _app(tmp_path)
+    with TestClient(app) as c:
+        body = c.get("/api/agent-binary", headers=_bearer(app)).json()
+        assert body["last_check"] is not None
+        assert body["last_check"]["ok"] is False
+        assert body["last_check"]["message"]  # the reason, whatever it was
+        assert body["last_check"]["checked_at"]
+
+
+def test_agent_binary_status_survives_a_missing_update_store(tmp_path, monkeypatch):
+    """Fleet reads this route on every render; a store hiccup is not a 500."""
+
+    monkeypatch.delenv("KENNY_AGENT_BINARY", raising=False)
+    app = _app(tmp_path)
+    with TestClient(app) as c:
+        app.state.update_store = None
+        r = c.get("/api/agent-binary", headers=_bearer(app))
+        assert r.status_code == 200
+        assert r.json()["last_check"] is None
+
+
+def test_manual_fetch_persists_its_outcome_durably(tmp_path, monkeypatch):
+    """An operator's failed retry outlives the process that ran it."""
+
+    monkeypatch.delenv("KENNY_AGENT_BINARY", raising=False)
+    monkeypatch.setenv("KENNY_GITHUB_TOKEN", "ghp_whatever")
+
+    def fake_fetch(**_kwargs):
+        return agent_release.FetchResult(
+            ok=False, source="none", message="GitHub API 403 (rate limited)"
+        )
+
+    monkeypatch.setattr(agent_release, "fetch_latest_agent_binary", fake_fetch)
+    app = _app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post("/api/agent-binary/fetch", headers=_bearer(app))
+        assert r.status_code == 502
+        row = c.portal.call(partial(app.state.update_store.get_availability, "agent"))
+        assert row["ok"] == 0
+        assert row["message"] == "GitHub API 403 (rate limited)"

@@ -1,8 +1,8 @@
 site_name: kenny
-site_description: Self-hosted remote administration and fleet monitoring for Windows PCs, driven by Claude.
-site_url: https://t11z.github.io/kenny/
-repo_url: https://github.com/t11z/kenny
-repo_name: t11z/kenny
+site_description: Self-hosted remote administration and fleet monitoring for Windows and Linux, driven by Claude.
+site_url: https://nullthrone.github.io/kenny/
+repo_url: https://github.com/nullthrone/kenny
+repo_name: nullthrone/kenny
 edit_uri: edit/main/docs/
 docs_dir: docs
 # The ADR template carries placeholder links (xxxx-…); keep it in the repo but out of the site.
@@ -23,24 +23,32 @@ theme:
   icon:
     repo: fontawesome/brands/github
   font:
-    text: Hanken Grotesk
+    # Public Sans is Nullthrone's body face. Material's theme.font only takes
+    # one text family (used for body + fallback headings); Jost — the display
+    # face for headings and structural nav/caps labels — is layered on top in
+    # docs/css/kenny-theme.css since Material has no second `text` slot.
+    text: Public Sans
     code: JetBrains Mono
   palette:
-    # Dark first (matches the dashboard's warm "border-collie" theme).
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: amber
-      accent: amber
-      toggle:
-        icon: material/weather-sunny
-        name: Switch to light mode
+    # Light first — Nullthrone is light-by-default (ink on warm paper); the
+    # ink scheme is the alternate, reached via the toggle or a dark system
+    # preference. `primary`/`accent: custom` opt out of Material's built-in
+    # named swatches so the exact Nullthrone brass token drives both (see
+    # kenny-theme.css) — https://squidfunk.github.io/mkdocs-material/setup/changing-the-colors/#custom-colors
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: amber
-      accent: amber
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
         name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
   features:
     - navigation.sections
     - navigation.top
@@ -62,6 +70,12 @@ markdown_extensions:
   - attr_list
   - md_in_html
   - tables
+  # The `:material-…:` shortcodes in the homepage's card grid are Material's
+  # icon syntax, not emoji — without this they render as literal text.
+  # https://squidfunk.github.io/mkdocs-material/reference/icons-emojis/
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - toc:
       permalink: true
   - pymdownx.highlight:
@@ -77,4 +91,4 @@ markdown_extensions:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/t11z/kenny
+      link: https://github.com/nullthrone/kenny

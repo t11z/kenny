@@ -20,6 +20,12 @@ skipped for offline agents so stale snapshots cannot flap.
 Every emitted notification is also persisted to the events table
 (``kind='alert'``) as the audit trail and the weekly digest's input.
 
+*Which* channels it is delivered on is asked fresh at every dispatch through a
+``notifier_provider`` (ADR-0054), not fixed at construction, so an operator who
+adds or clears a channel in the dashboard sees it apply to the next alert
+without a restart. Zero channels stays a legitimate state — the loop still
+evaluates and records, it just pushes nothing.
+
 An optional ``open_ticket`` callable may be injected to turn a notification
 into a ticket. It is opt-in (a server without the ticket surface simply passes
 nothing) and best-effort: delivery happens first and a failing ticket call is
@@ -38,7 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
@@ -52,7 +58,12 @@ from .trends import DISK_FULL_ALERT_DAYS, disk_forecast
 
 logger = logging.getLogger("kenny.alerting")
 
-_ORDER = {"ok": 0, "warn": 1, "crit": 2}
+# ``posture`` (ADR-0058) ranks with ``ok``: a posture section never escalates
+# and never recovers, so its transitions only ever update state -- which is
+# what gives a posture finding its age.
+_ORDER = {"ok": 0, "posture": 0, "warn": 1, "crit": 2}
+_INCIDENT = ("warn", "crit")
+_TITLE_MAX = 96
 
 DEFAULT_COOLDOWN_S = 3600
 # Three missed 900 s telemetry pushes (docs/protocol.md § Telemetry).
@@ -63,6 +74,12 @@ _PRUNE_EVERY = timedelta(hours=24)
 _FORECAST_COOLDOWN = timedelta(hours=24)
 
 _DAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+# A zero-argument callable returning the channels to deliver on right now. The
+# composition root passes ``notify.NotifierProvider`` (settings-backed, so an
+# operator change applies to the next dispatch, ADR-0054); a fixed list passed
+# as ``notifiers=`` is wrapped into one of these internally.
+NotifierSource = Callable[[], Sequence[Notifier]]
 
 
 class _Prunable(Protocol):
@@ -89,7 +106,8 @@ class AlertEngine:
         alert_state: AlertStateStore,
         event_store: EventStore,
         registry: AgentRegistry,
-        notifiers: list[Notifier],
+        notifiers: Sequence[Notifier] | None = None,
+        notifier_provider: NotifierSource | None = None,
         settings: Any = None,
         cooldown_s: int = DEFAULT_COOLDOWN_S,
         offline_after_s: int = DEFAULT_OFFLINE_AFTER_S,
@@ -104,7 +122,17 @@ class AlertEngine:
         self._alert_state = alert_state
         self._event_store = event_store
         self._registry = registry
-        self._notifiers = notifiers
+        # Channels are obtained per dispatch, never captured at boot (ADR-0054):
+        # ``notifier_provider`` is asked again for every notification, so adding,
+        # changing or clearing a channel from the dashboard applies immediately.
+        # ``notifiers=`` remains for direct construction (tests, a server with a
+        # deliberately fixed set) and is wrapped in a constant provider; passing
+        # both would make it ambiguous which one actually delivers, so it is
+        # refused loudly rather than resolved silently.
+        if notifiers is not None and notifier_provider is not None:
+            raise ValueError("pass either notifiers= or notifier_provider=, not both")
+        fixed: tuple[Notifier, ...] = tuple(notifiers or ())
+        self._notifier_source: NotifierSource = notifier_provider or (lambda: fixed)
         # When ``settings`` is provided the alerting knobs are read live from it
         # (DB > env > default) on every pass, so an operator change from the
         # dashboard takes effect without a restart. The scalar kwargs remain as
@@ -137,6 +165,22 @@ class AlertEngine:
         self._ticket_rules = ticket_rules
 
     # -- live config accessors -------------------------------------------------
+
+    @property
+    def _notifiers(self) -> Sequence[Notifier]:
+        """The channels to deliver on right now — resolved, never remembered.
+
+        Zero channels is a legitimate state: the loop keeps evaluating and
+        recording history, it just pushes nothing. A provider that raises is
+        treated the same way, because a broken channel lookup must not be able
+        to stop the evaluation pass.
+        """
+
+        try:
+            return self._notifier_source()
+        except Exception:  # noqa: BLE001 - delivery is best-effort (ADR-0027)
+            logger.exception("resolving the alert delivery channels failed")
+            return ()
 
     def _cfg(self, key: str, fallback: Any) -> Any:
         return self._settings.get(key) if self._settings is not None else fallback
@@ -259,6 +303,7 @@ class AlertEngine:
         alert_sections: dict[str, str] = {}
         recovery_sections: dict[str, str] = {}
 
+        headline = ""
         for name, section in evaluation["sections"].items():
             scope = f"section:{name}"
             row = state.get(scope)
@@ -266,23 +311,29 @@ class AlertEngine:
             new = section["status"]
             if new == old:
                 continue
+            # The body carries the finding, not the transition: what is wrong
+            # and since when is what a reader acts on; "ok -> crit" is
+            # bookkeeping the Log page already keeps.
             reason = section.get("reason") or section.get("summary") or ""
-            line = f"{name}: {old} -> {new}" + (f" ({reason})" if reason else "")
             notified = False
-            if _ORDER.get(new, 0) > _ORDER.get(old, 0):
+            if new in _INCIDENT and _ORDER.get(new, 0) > _ORDER.get(old, 0):
                 # Escalations to crit always fire; warn respects the cooldown.
                 if new == "crit" or self._cooldown_passed(row, now):
-                    alert_lines.append(line)
+                    alert_lines.append(f"[{new.upper()}] {name}: {reason}".rstrip(": "))
                     alert_sections[name] = new
-                    alert_worst = "crit" if new == "crit" else alert_worst
-                    if alert_worst == "ok":
+                    if new == "crit" and alert_worst != "crit":
+                        alert_worst = "crit"
+                        headline = f"{name}: {reason}" if reason else name
+                    elif alert_worst == "ok":
                         alert_worst = "warn"
+                        headline = f"{name}: {reason}" if reason else name
                     notified = True
             elif new == "ok" and self._episode_was_notified(row):
-                recovery_lines.append(line)
+                recovery_lines.append(f"[RESOLVED] {name}: {reason}".rstrip(": "))
                 recovery_sections[name] = old
                 notified = True
-            # crit -> warn improvements update state silently.
+            # crit -> warn improvements, and every transition into or out of
+            # posture, update state silently (ADR-0058).
             await self._alert_state.upsert(
                 agent_id,
                 scope,
@@ -306,9 +357,12 @@ class AlertEngine:
 
         out: list[Notification] = []
         if alert_lines:
+            title = f"{agent_id}: {headline}"
+            if len(title) > _TITLE_MAX:
+                title = title[: _TITLE_MAX - 1] + "…"
             out.append(
                 Notification(
-                    title=f"{agent_id} health: {overall}",
+                    title=title,
                     body="\n".join(alert_lines),
                     priority="high" if alert_worst == "crit" else "default",
                     tags=["rotating_light" if alert_worst == "crit" else "warning"],
@@ -504,8 +558,17 @@ class AlertEngine:
             fields={"kind": note.kind, "priority": note.priority},
             at=now.isoformat(),
         )
+        # Each channel is isolated: ``Notifier.send`` swallows its own transport
+        # errors (ADR-0027), and this guard covers everything else a channel
+        # could throw — so one misconfigured or misbehaving channel can never
+        # cost the others their delivery.
         for notifier in self._notifiers:
-            await notifier.send(note)  # best-effort; send() never raises
+            try:
+                await notifier.send(note)
+            except Exception:  # noqa: BLE001 - one dead channel must not stop the rest
+                logger.exception(
+                    "delivery via %s failed", getattr(notifier, "name", type(notifier).__name__)
+                )
         # Which notifications become a ticket is operator policy (ticket_rules.py),
         # decided by ``ticket_rules.decide`` -- called the same way whether or
         # not a mirror is wired, so "no rules configured" and "no mirror at

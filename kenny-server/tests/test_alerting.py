@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kenny_server.alerting import AlertEngine
-from kenny_server.notify import Notification
+from kenny_server.notify import Notification, Notifier
 from kenny_server.store import AlertStateStore, EventStore, TelemetryStore
 
 NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -97,7 +97,9 @@ async def test_first_seen_crit_fires_once(stores) -> None:
     assert len(sent) == 1
     assert sent[0].kind == "alert"
     assert sent[0].priority == "high"
-    assert "disk: ok -> crit" in sent[0].body
+    # The body is the finding, not the transition (ADR-0058).
+    assert sent[0].body == "[CRIT] disk: C: 96% full (>=95%)"
+    assert sent[0].title == "pc1: disk: C: 96% full (>=95%)"
     assert sent[0].agent_id == "pc1"
 
     # Unchanged crit on the next pass: silent (transitions only, no reminders).
@@ -124,7 +126,7 @@ async def test_recovery_fires_after_notified_alert(stores) -> None:
     sent = await engine.evaluate_once(NOW + timedelta(minutes=11))
     assert len(sent) == 1
     assert sent[0].kind == "recovery"
-    assert "disk: crit -> ok" in sent[0].body
+    assert sent[0].body == "[RESOLVED] disk: C: 50% full"
 
 
 async def test_flap_is_suppressed_by_cooldown(stores) -> None:
@@ -158,7 +160,7 @@ async def test_escalation_to_crit_bypasses_cooldown(stores) -> None:
     sent = await engine.evaluate_once(NOW + timedelta(minutes=11))
     assert len(sent) == 1
     assert sent[0].priority == "high"
-    assert "disk: warn -> crit" in sent[0].body
+    assert sent[0].body == "[CRIT] disk: C: 96% full (>=95%)"
 
 
 async def test_offline_alert_and_recovery(stores) -> None:
@@ -603,3 +605,326 @@ async def test_maybe_prune_does_not_force_when_retention_grows(stores) -> None:
     # The regular cadence still applies once due.
     await engine._maybe_prune(NOW + timedelta(hours=25))
     assert spy.calls == [7, 30]
+
+
+# -- delivery channels are resolved per dispatch (ADR-0054) --------------------
+#
+# The engine holds a provider, not a list, so adding/changing/clearing a channel
+# in the dashboard reaches the next alert without restarting the server. These
+# drive a single long-lived engine across a configuration change -- rebuilding
+# it would prove nothing, since that is exactly what a restart does.
+
+
+class _RecordingNotifier:
+    """A channel that records what it was handed."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.sent: list[Notification] = []
+
+    async def send(self, notification: Notification) -> None:
+        self.sent.append(notification)
+
+
+class _ExplodingNotifier:
+    """A misconfigured channel whose send raises instead of swallowing."""
+
+    name = "boom"
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def send(self, notification: Notification) -> None:
+        self.attempts += 1
+        raise RuntimeError("this channel is misconfigured")
+
+
+async def test_a_channel_configured_later_delivers_without_a_restart(stores) -> None:
+    store, events, state = stores
+    channels: list[Notifier] = []
+    engine = AlertEngine(
+        store=store,
+        alert_state=state,
+        event_store=events,
+        registry=FakeRegistry({"pc1"}),
+        notifier_provider=lambda: channels,
+    )
+
+    # Zero channels is legitimate: the pass still evaluates and records history.
+    await insert(store, snapshot(96.0), NOW - timedelta(minutes=1))
+    sent = await engine.evaluate_once(NOW)
+    assert len(sent) == 1
+    assert len(await events.query(kind="alert")) == 1
+
+    # The operator adds a channel. No new engine, no new app, no restart.
+    late = _RecordingNotifier("late")
+    channels.append(late)
+
+    await insert(store, snapshot(50.0), NOW + timedelta(minutes=1))
+    recovery = await engine.evaluate_once(NOW + timedelta(minutes=2))
+    assert [n.kind for n in recovery] == ["recovery"]
+    assert [n.kind for n in late.sent] == ["recovery"]
+
+
+async def test_a_channel_cleared_later_stops_delivering(stores) -> None:
+    store, events, state = stores
+    channel = _RecordingNotifier("configured")
+    channels: list[Notifier] = [channel]
+    engine = AlertEngine(
+        store=store,
+        alert_state=state,
+        event_store=events,
+        registry=FakeRegistry({"pc1"}),
+        notifier_provider=lambda: channels,
+    )
+
+    await insert(store, snapshot(96.0), NOW - timedelta(minutes=1))
+    await engine.evaluate_once(NOW)
+    assert len(channel.sent) == 1
+
+    channels.clear()
+    await insert(store, snapshot(50.0), NOW + timedelta(minutes=1))
+    assert len(await engine.evaluate_once(NOW + timedelta(minutes=2))) == 1
+    assert len(channel.sent) == 1  # the recovery went nowhere
+    assert len(await events.query(kind="alert")) == 2  # but is still on record
+
+
+async def test_a_channel_whose_send_raises_never_costs_the_others(stores) -> None:
+    """One dead channel must not stall alerting for the rest."""
+
+    store, events, state = stores
+    first, last = _RecordingNotifier("first"), _RecordingNotifier("last")
+    boom = _ExplodingNotifier()
+    engine = AlertEngine(
+        store=store,
+        alert_state=state,
+        event_store=events,
+        registry=FakeRegistry({"pc1"}),
+        # The exploding channel sits *between* two healthy ones, so a test that
+        # only proved "delivery continued" by ordering would not pass.
+        notifier_provider=lambda: [first, boom, last],
+    )
+
+    await insert(store, snapshot(96.0), NOW - timedelta(minutes=1))
+    sent = await engine.evaluate_once(NOW)
+
+    assert len(sent) == 1
+    assert boom.attempts == 1
+    assert len(first.sent) == 1
+    assert len(last.sent) == 1
+    assert len(await events.query(kind="alert")) == 1
+
+
+async def test_a_provider_that_raises_never_breaks_the_pass(stores) -> None:
+    store, events, state = stores
+
+    def _explode() -> list[Notifier]:
+        raise RuntimeError("resolving channels failed")
+
+    engine = AlertEngine(
+        store=store,
+        alert_state=state,
+        event_store=events,
+        registry=FakeRegistry({"pc1"}),
+        notifier_provider=_explode,
+    )
+    await insert(store, snapshot(96.0), NOW - timedelta(minutes=1))
+
+    sent = await engine.evaluate_once(NOW)
+    assert len(sent) == 1  # evaluated and recorded; it just pushed nothing
+    assert len(await events.query(kind="alert")) == 1
+
+
+def test_notifiers_and_a_provider_together_are_refused(stores) -> None:
+    """Two sources of truth for delivery is a mistake that must not be silent."""
+
+    store, events, state = stores
+    with pytest.raises(ValueError):
+        AlertEngine(
+            store=store,
+            alert_state=state,
+            event_store=events,
+            registry=FakeRegistry(),
+            notifiers=[FakeNotifier()],
+            notifier_provider=lambda: [],
+        )
+
+
+async def test_the_engine_delivers_on_channels_written_to_settings(stores) -> None:
+    """End to end: a dashboard write reaches the wire on the next alert.
+
+    The joined seam -- the real ``Settings`` resolver, the real
+    ``NotifierProvider``, the real ``WebhookNotifier`` -- against a mock
+    transport. A break in any one of the three fails this.
+    """
+
+    import httpx
+
+    from kenny_server.config import Settings
+    from kenny_server.notify import NotifierProvider
+
+    class _MemStore:
+        def __init__(self) -> None:
+            self.data: dict[str, str] = {}
+
+        async def all(self) -> dict[str, str]:
+            return dict(self.data)
+
+        async def set(self, key: str, value: str) -> None:
+            self.data[key] = value
+
+        async def delete(self, key: str) -> bool:
+            return self.data.pop(key, None) is not None
+
+    posted: list[httpx.Request] = []
+
+    def _client() -> httpx.AsyncClient:
+        def handler(request: httpx.Request) -> httpx.Response:
+            posted.append(request)
+            return httpx.Response(200)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    store, events, state = stores
+    settings = Settings(_MemStore(), env={}, apply_hooks={})
+    engine = AlertEngine(
+        store=store,
+        alert_state=state,
+        event_store=events,
+        registry=FakeRegistry({"pc1"}),
+        notifier_provider=NotifierProvider(settings=settings, client_factory=_client),
+        settings=settings,
+    )
+
+    await insert(store, snapshot(96.0), NOW - timedelta(minutes=1))
+    await engine.evaluate_once(NOW)
+    assert posted == []  # nothing configured yet
+
+    await settings.set("KENNY_WEBHOOK_URL", "https://hook.example/live")
+
+    await insert(store, snapshot(50.0), NOW + timedelta(minutes=1))
+    await engine.evaluate_once(NOW + timedelta(minutes=2))
+    assert [str(r.url) for r in posted] == ["https://hook.example/live"]
+
+
+# -- one verdict per host (ADR-0058) ----------------------------------------
+
+
+def test_alert_loop_and_dashboard_agree_on_reliability(tmp_path, monkeypatch) -> None:
+    """Joined across the store's annotate seam, the persisted classification
+    and the alert engine: a pattern the classifier persisted as benign is
+    scored benign by the alert loop too -- it never sees the raw payload the
+    old volume fallback would have escalated on -- and the dashboard's
+    ``/api/agent`` read says the same thing.
+    """
+
+    from functools import partial
+
+    from starlette.testclient import TestClient
+
+    from kenny_server import event_categories
+    from kenny_server.main import build_app
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("KENNY_ALERT_INTERVAL_SECS", "0")
+    app = build_app(db_path=str(tmp_path / "agree.sqlite"))
+    now = datetime(2026, 7, 8, 0, 0, tzinfo=timezone.utc)
+    by_day = {f"2026-07-0{d}": 100 for d in range(1, 8)}
+    snap = {"reliability": {"status": "ok", "summary": "700 error/critical events in 7d",
+            "recent_crashes": 700, "window_days": 7, "events": [
+        {"source": "DistributedCOM", "event_id": 10016, "level": "error", "count": 700,
+         "sample": "stale COM permission", "by_day": by_day,
+         "last_seen": "2026-07-07T23:00:00Z"},
+    ]}}
+    event_categories.reset_state()
+    try:
+        with TestClient(app) as c:
+            store = app.state.store
+            c.portal.call(partial(app.state.classification_store.upsert_many, [{
+                "source": "DistributedCOM", "event_id": 10016, "category": "Windows service",
+                "severity": "benign", "cause": "stale COM permission",
+                "model": event_categories.CATEGORIZE_MODEL,
+            }]))
+            c.portal.call(event_categories.load_persisted)
+            c.portal.call(partial(store.insert, "pc1", "2026-07-07T23:30:00Z", snap,
+                                  received_at="2026-07-07T23:30:00Z"))
+
+            h = {"Authorization": f"Bearer {app.state.operator_token}"}
+            section = c.get("/api/agent/pc1", headers=h).json()["health"]["sections"]["reliability"]
+            assert section["status"] == "ok"
+            assert "known-benign" in section["reason"]
+
+            notifier = FakeNotifier()
+            engine = AlertEngine(
+                store=store, alert_state=app.state.alert_state, event_store=app.state.event_store,
+                registry=FakeRegistry({"pc1"}), notifiers=[notifier],
+            )
+            assert c.portal.call(partial(engine.evaluate_once, now)) == []
+            assert notifier.sent == []
+            row = c.portal.call(partial(app.state.alert_state.get, "pc1", "section:reliability"))
+            assert row is None or row["status"] == "ok"
+    finally:
+        event_categories.reset_state()
+
+
+# -- posture never notifies; findings carry an age (ADR-0058) ---------------
+
+
+def _posture_snapshot(protected: bool, disk_pct: float = 50.0) -> dict:
+    snap = snapshot(disk_pct)
+    snap["encryption"] = {
+        "status": "ok", "summary": "",
+        "volumes": [{"mount": "C:", "protection_status": 1 if protected else 0}],
+    }
+    return snap
+
+
+async def test_posture_transitions_never_notify_but_are_aged(stores) -> None:
+    store, _, state = stores
+    notifier = FakeNotifier()
+    engine = make_engine(stores, notifier)
+
+    # ok -> posture: silent, but the state row (and so the finding's age) is written.
+    await insert(store, _posture_snapshot(protected=False), NOW - timedelta(minutes=1))
+    assert await engine.evaluate_once(NOW) == []
+    row = await state.get("pc1", "section:encryption")
+    assert row["status"] == "posture" and row["since"] == NOW.isoformat()
+    assert row["last_notified_at"] is None
+
+    # Unchanged posture on the next pass: nothing, and `since` keeps its date.
+    await insert(store, _posture_snapshot(protected=False), NOW + timedelta(days=3))
+    assert await engine.evaluate_once(NOW + timedelta(days=3, minutes=1)) == []
+    assert (await state.get("pc1", "section:encryption"))["since"] == NOW.isoformat()
+
+    # posture -> ok: silent too (there was no announced episode to resolve).
+    await insert(store, _posture_snapshot(protected=True), NOW + timedelta(days=4))
+    assert await engine.evaluate_once(NOW + timedelta(days=4, minutes=1)) == []
+    assert notifier.sent == []
+
+
+async def test_warn_to_posture_is_a_silent_demotion(stores) -> None:
+    store, _, state = stores
+    notifier = FakeNotifier()
+    engine = make_engine(stores, notifier)
+    # A section the loop had recorded as warn (an older rule) now scores posture.
+    await state.upsert("pc1", "section:encryption", status="warn",
+                       since=(NOW - timedelta(days=2)).isoformat(),
+                       last_notified_at=(NOW - timedelta(days=2)).isoformat())
+    await insert(store, _posture_snapshot(protected=False), NOW - timedelta(minutes=1))
+    assert await engine.evaluate_once(NOW) == []
+    row = await state.get("pc1", "section:encryption")
+    assert row["status"] == "posture"
+    assert row["since"] == NOW.isoformat()
+
+
+async def test_posture_to_incident_escalates_like_ok(stores) -> None:
+    store, _, _ = stores
+    notifier = FakeNotifier()
+    engine = make_engine(stores, notifier)
+    await insert(store, _posture_snapshot(protected=False), NOW - timedelta(minutes=1))
+    assert await engine.evaluate_once(NOW) == []
+    # The disk fills up: that escalation fires regardless of the posture section.
+    await insert(store, _posture_snapshot(protected=False, disk_pct=96.0), NOW + timedelta(minutes=5))
+    sent = await engine.evaluate_once(NOW + timedelta(minutes=6))
+    assert [n.body for n in sent] == ["[CRIT] disk: C: 96% full (>=95%)"]
+    assert sent[0].sections == {"disk": "crit"}
