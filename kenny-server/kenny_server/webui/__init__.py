@@ -38,12 +38,13 @@ from ..chat import (
 )
 from ..policy import PolicyEngine
 from ..event_categories import annotate_snapshots
+from .. import findings
 from ..forecast import build_facts, deterministic_summary, forecast_events
 from ..recommend import ai_available, recommend_events, warning_facts
 from ..registry import AgentRegistry
 from ..store import ChatHistoryStore, EventStore, PolicyStore, TelemetryStore
 from ..tokenstore import AgentTokenStore
-from ..tools import CallLog, ScreenshotStore, build_health, supports_tool
+from ..tools import CallLog, ScreenshotStore, build_health, health_for, supports_tool
 from ..tunnel import AgentTunnel, ToolError
 from ..webfilter import (
     BYPASS_REQUEST_CATEGORY,
@@ -275,7 +276,7 @@ def build_api_routes(
         principal = principal_of(request)
         if principal is not None:
             ids = visible_ids(principal, ids)
-        agents = [await _overview(i, registry, store) for i in ids]
+        agents = [await _overview(i, registry, store, alert_state=alert_state) for i in ids]
         from .. import health_rules
 
         overall = health_rules.worst(*(a["overall"] for a in agents if a["overall"] != "unknown"))
@@ -355,7 +356,9 @@ def build_api_routes(
             points_by_agent[agent_id] = [
                 {
                     "collected_at": d["collected_at"],
-                    "overall": build_health(d["snapshot"], agent_os=agent_os)["overall"],
+                    "overall": build_health(
+                        d["snapshot"], agent_os=agent_os, now=d["collected_at"]
+                    )["overall"],
                 }
                 for d in daily
             ]
@@ -402,11 +405,23 @@ def build_api_routes(
                 "os": agent.os if agent else "windows",
                 "meta": agent.meta if agent else {},
                 "snapshot": snapshot,
-                "health": build_health(snapshot, agent_os=agent.os if agent else "windows"),
+                "health": await health_for(
+                    agent_id,
+                    snapshot,
+                    agent_os=agent.os if agent else "windows",
+                    alert_state=alert_state,
+                ),
                 "collected_at": latest["collected_at"] if latest else None,
             }
             for agent_id, agent, snapshot, latest in rows
         ]
+        # (host, section) -> the aged section dict, for the items below.
+        aged = {
+            (a["agent_id"], name): section
+            for a in agents
+            for name, section in a["health"]["sections"].items()
+        }
+        posture_count = sum(len(findings.posture_sections(a["health"])) for a in agents)
 
         disk_forecasts: dict[str, list[dict[str, Any]]] = {}
         points_by_agent: dict[str, list[dict[str, Any]]] = {}
@@ -418,7 +433,9 @@ def build_api_routes(
             points_by_agent[agent_id] = [
                 {
                     "collected_at": d["collected_at"],
-                    "overall": build_health(d["snapshot"], agent_os=agent_os)["overall"],
+                    "overall": build_health(
+                        d["snapshot"], agent_os=agent_os, now=d["collected_at"]
+                    )["overall"],
                 }
                 for d in daily
             ]
@@ -452,16 +469,14 @@ def build_api_routes(
         ]
 
         section_rows = overview["sections"]["rows"]
-        crit_items = [
-            _today_section_item(row["section"], m, "crit")
-            for row in section_rows
-            for m in row["members_crit"]
-        ]
-        warn_items = [
-            _today_section_item(row["section"], m, "warn")
-            for row in section_rows
-            for m in row["members_warn"]
-        ]
+        section_items = findings.rank_today_items(
+            [
+                _today_section_item(row["section"], m, severity, aged.get((m["agent_id"], row["section"])))
+                for row in section_rows
+                for severity, members in (("crit", row["members_crit"]), ("warn", row["members_warn"]))
+                for m in members
+            ]
+        )
 
         # Held approvals: at least as strict as `/api/approvals` (operator-only)
         # -- a scoped `user` gets none, matching /api/inbox's approvals slice.
@@ -496,13 +511,17 @@ def build_api_routes(
                     continue
                 stale_items.append(_today_ticket_item(t))
 
-        items = (crit_items + warn_items + approval_items + stale_items)[:3]
+        items = (section_items + approval_items + stale_items)[:3]
 
         return JSONResponse(
             {
                 "generated_at": overview["generated_at"],
                 "verdict_sentence": verdict_sentence,
                 "items": items,
+                # Standing facts are counted, not ranked: they never compete
+                # with an incident for the top of the page (ADR-0058).
+                "posture_count": posture_count,
+                "posture_line": _posture_line(posture_count),
                 "donut": donut,
                 "trend_30d": {"days": trend_days},
                 "kpis": overview["kpis"],
@@ -567,7 +586,9 @@ def build_api_routes(
         hist_points = [
             {
                 "collected_at": h["collected_at"],
-                "overall": build_health(h["snapshot"], agent_os=agent_os)["overall"],
+                "overall": build_health(
+                    h["snapshot"], agent_os=agent_os, now=h["collected_at"]
+                )["overall"],
             }
             for h in history
         ]
@@ -579,7 +600,9 @@ def build_api_routes(
                 "meta": agent.meta if agent else {},
                 "collected_at": latest["collected_at"] if latest else None,
                 "snapshot": snapshot,
-                "health": build_health(snapshot, agent_os=agent_os),
+                "health": await health_for(
+                    agent_id, snapshot, agent_os=agent_os, alert_state=alert_state
+                ),
                 # Can this host's OS serve the account-governance verbs at all?
                 # Derived from the same table the write route enforces, so the
                 # dashboard never hard-codes an OS list of its own (ADR-0043).
@@ -2218,14 +2241,16 @@ async def _known_ids(registry: AgentRegistry, store: TelemetryStore) -> list[str
 
 
 async def _overview(
-    agent_id: str, registry: AgentRegistry, store: TelemetryStore
+    agent_id: str, registry: AgentRegistry, store: TelemetryStore, *, alert_state: Any = None
 ) -> dict[str, Any]:
     agent = registry.get(agent_id)
     latest = await store.latest(agent_id)
     snapshot = latest["snapshot"] if latest else None
-    health = build_health(snapshot, agent_os=agent.os if agent else "windows")
+    health = await health_for(
+        agent_id, snapshot, agent_os=agent.os if agent else "windows", alert_state=alert_state
+    )
     sections = health["sections"]
-    flagged = [n for n, s in sections.items() if s["status"] in ("warn", "crit")]
+    flagged = [n for n, s in sections.items() if s["attention"]]
 
     def _by_status(level: str) -> list[dict[str, Any]]:
         # Enough detail for the dashboard to render the flagged section cards.
@@ -2247,6 +2272,8 @@ async def _overview(
         "agent_version": (agent.meta.get("version") if agent else None) or None,
         "overall": health["overall"],
         "flagged_sections": flagged,
+        # Standing facts (ADR-0058): listed, never rolled up, never alarmed on.
+        "posture_sections": findings.posture_sections(health),
         "warn_sections": _by_status("warn"),
         "crit_sections": _by_status("crit"),
         "summary": _fleet_summary(health, snapshot),
@@ -2268,6 +2295,9 @@ def _fleet_summary(health: dict[str, Any], snapshot: dict[str, Any] | None) -> s
             text = s.get("reason") or s.get("summary") or name
             extra = f" +{len(worst) - 1} more" if len(worst) > 1 else ""
             return f"{text}{extra}"
+    posture = findings.posture_sections(health)
+    if posture:
+        return f"no incidents · {len(posture)} posture finding(s)"
     return "all green"
 
 
@@ -2311,6 +2341,10 @@ _SECTION_ACTION: dict[str, str] = {
     "logon_failures": "REVIEW SIGN-INS",
     "backup_status": "CHECK BACKUP",
     "net_quality": "CHECK NETWORK",
+    "services": "REVIEW SERVICES",
+    "time_sync": "CHECK CLOCK",
+    "encryption": "REVIEW ENCRYPTION",
+    "uptime": "SCHEDULE REBOOT",
 }
 
 # Small enough vocabulary (single digits, the whole fleet in a household) to
@@ -2370,12 +2404,26 @@ def section_target(agent_id: str, section: str) -> str:
     return f"#/fleet/{quote(agent_id, safe='')}?section={quote(section, safe='')}"
 
 
-def _today_section_item(section: str, member: dict[str, Any], severity: str) -> dict[str, Any]:
+def _posture_line(count: int) -> str | None:
+    """The one line Today says about standing facts, or nothing at all."""
+
+    if count == 0:
+        return None
+    return f"{count} posture finding{'' if count == 1 else 's'} unchanged"
+
+
+def _today_section_item(
+    section: str,
+    member: dict[str, Any],
+    severity: str,
+    aged: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """One `/api/today` item for a flagged section on one host.
 
     ``member`` is a ``fleet_stats._member`` row (``{agent_id, value, detail}``)
     already produced by ``aggregate_overview``'s ``sections`` -- a display
-    reshape, not a new computation.
+    reshape, not a new computation. ``aged`` is the section dict after
+    ``findings.stamp_age``; it lends the item its ``since``/``age_seconds``.
     """
 
     return {
@@ -2385,6 +2433,8 @@ def _today_section_item(section: str, member: dict[str, Any], severity: str) -> 
         "detail": member["detail"],
         "action": _SECTION_ACTION.get(section, "REVIEW"),
         "target": section_target(member["agent_id"], section),
+        "since": (aged or {}).get("since"),
+        "age_seconds": (aged or {}).get("age_seconds"),
     }
 
 

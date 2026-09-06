@@ -5,6 +5,8 @@ export function severityColor(severity: Severity): string {
   switch (severity) {
     case 'ok':
       return 'var(--ok)'
+    case 'posture':
+      return 'var(--text-muted)'
     case 'warn':
       return 'var(--warn)'
     case 'crit':
@@ -18,6 +20,8 @@ export function severityLabel(severity: Severity): string {
   switch (severity) {
     case 'ok':
       return 'HEALTHY'
+    case 'posture':
+      return 'POSTURE'
     case 'warn':
       return 'WARNING'
     case 'crit':

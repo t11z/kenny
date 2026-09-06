@@ -718,3 +718,71 @@ async def test_e2e_spoofed_agent_id_is_dropped(tmp_path, monkeypatch) -> None:
         assert await app.state.store.latest("dev") is not None
 
         await agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_e2e_telemetry_push_kicks_classification(tmp_path, monkeypatch) -> None:
+    """The insert-time hook (ADR-0058), joined end to end: a telemetry push
+    over the real tunnel starts one background classification batch for the
+    snapshot's reliability patterns, the verdict lands in the cache and the
+    store -- and the push itself returned before the (slow) client answered."""
+
+    import time
+
+    from kenny_server import event_categories
+
+    monkeypatch.setenv("KENNY_SERVER_PRIVATE_KEY", SERVER_SEED_B64)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("KENNY_ALERT_INTERVAL_SECS", "0")
+
+    class _Messages:
+        calls = 0
+
+        def create(self, **kwargs):
+            _Messages.calls += 1
+            time.sleep(1.0)  # slow enough that the push visibly lands first, even on a loaded CI box
+            n = len(kwargs["messages"][0]["content"].splitlines()) - 1  # minus "Inputs:"
+            body = ", ".join(
+                '{"category": "App crash / hang", "severity": "notable", "cause": "e2e"}'
+                for _ in range(n)
+            )
+
+            class _R:
+                content = [type("B", (), {"text": f"[{body}]"})()]
+
+            return _R()
+
+    class _Client:
+        messages = _Messages()
+
+    port = _free_port()
+    app = build_app(db_path=str(tmp_path / "e2e_classify.sqlite"), client_factory=lambda: _Client())
+    event_categories.reset_state()
+    try:
+        async with _Server(app, port):
+            agent = MockAgent(f"ws://127.0.0.1:{port}/agent/ws", "dev")
+            await app.state.key_store.enroll("dev", agent.public_key_b64)
+            await agent.start()
+            await asyncio.sleep(0.1)
+
+            await agent.push_telemetry()
+            await asyncio.sleep(0.2)
+            # The snapshot is stored before the classifier has answered.
+            assert await app.state.store.latest("dev") is not None
+            assert _Messages.calls == 1
+            assert not event_categories._cache
+
+            await asyncio.sleep(1.5)
+            expected = {
+                (e["source"], e["event_id"])
+                for e in _fixture("telemetry_snapshot.json")["snapshot"]["reliability"]["events"]
+            }
+            assert expected <= set(event_categories._cache)
+            rows = await app.state.classification_store.list()
+            assert {(r["source"], r["event_id"]) for r in rows} == expected
+            # And the alert loop's read now carries the persisted severity.
+            latest = await app.state.store.latest("dev")
+            assert {e["severity"] for e in latest["snapshot"]["reliability"]["events"]} == {"notable"}
+            await agent.stop()
+    finally:
+        event_categories.reset_state()

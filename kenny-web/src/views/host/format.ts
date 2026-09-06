@@ -24,6 +24,8 @@ export function osLabel(os: string): string {
 export function severityRank(s: Severity): number {
   switch (s) {
     case 'ok':
+      return 4
+    case 'posture':
       return 3
     case 'warn':
       return 2
@@ -124,4 +126,17 @@ export function formatGenericValue(value: unknown, depth = 0): string {
     return entries.map(([k, v]) => `${k}: ${formatGenericValue(v, depth + 1)}`).join(' · ')
   }
   return String(value)
+}
+
+/**
+ * "since 3 d" / "since 5 h" for a finding's standing age, from the server's
+ * `age_seconds`; empty when the alert loop has not aged it yet.
+ */
+export function formatSince(ageSeconds: number | null | undefined): string {
+  if (ageSeconds == null || ageSeconds < 0) return ''
+  const minutes = Math.round(ageSeconds / 60)
+  if (minutes < 60) return `since ${Math.max(1, minutes)} min`
+  const hours = Math.round(minutes / 60)
+  if (hours < 48) return `since ${hours} h`
+  return `since ${Math.round(hours / 24)} d`
 }

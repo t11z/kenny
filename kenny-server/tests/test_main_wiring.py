@@ -599,3 +599,73 @@ def test_triage_can_be_switched_off_while_a_key_is_configured(tmp_path, monkeypa
     app = build_app(db_path=str(tmp_path / "off.sqlite"))
     with TestClient(app):
         assert app.state.tickets._triage is None
+
+
+# -- the persisted event classification rides the store seam (ADR-0058) -----
+
+
+def test_store_annotators_are_wired_in_order(tmp_path) -> None:
+    """``build_app`` composes suppression first, classification second on the
+    telemetry store's read-path seam, and hands the tunnel the classifier's
+    insert-time hook -- the wiring every "one verdict per host" guarantee
+    rests on."""
+
+    from kenny_server import event_categories
+
+    app = build_app(db_path=str(tmp_path / "annotators.sqlite"))
+    store = app.state.store
+    assert [getattr(fn, "__func__", fn) for fn in store.annotators] == [
+        app.state.suppression.mark.__func__,
+        event_categories.mark,
+    ]
+    hook = app.state.tunnel.after_insert
+    assert isinstance(hook, partial) and hook.func is event_categories.schedule_classification
+    assert app.state.classification_store is not None
+
+
+def test_boot_warms_the_classifier_from_stored_snapshots(tmp_path, monkeypatch) -> None:
+    """After an upgrade the first alert-loop pass must already score on
+    severity: startup schedules a classification batch for whatever the
+    latest stored snapshots carry that is still unclassified."""
+
+    from functools import partial as _partial
+
+    from kenny_server import event_categories
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("KENNY_ALERT_INTERVAL_SECS", "0")
+
+    class _Messages:
+        calls = 0
+
+        def create(self, **_kwargs):
+            _Messages.calls += 1
+
+            class _R:
+                content = [type("B", (), {"text": '[{"category": "Other", "severity": "benign", "cause": "noise"}]'})()]
+
+            return _R()
+
+    class _Client:
+        messages = _Messages()
+
+    db_path = str(tmp_path / "warm.sqlite")
+    snap = {"reliability": {"status": "ok", "summary": "", "recent_crashes": 3, "events": [
+        {"source": "Warm", "event_id": 7, "level": "error", "count": 3, "sample": "x"}]}}
+    event_categories.reset_state()
+    try:
+        app1 = build_app(db_path=db_path)
+        with TestClient(app1) as c:
+            c.portal.call(_partial(app1.state.store.insert, "pc1", "2026-07-07T23:30:00Z", snap))
+        assert _Messages.calls == 0
+
+        app2 = build_app(db_path=db_path, client_factory=lambda: _Client())
+        with TestClient(app2) as c:
+            c.portal.call(_partial(asyncio.sleep, 0.2))
+            assert _Messages.calls == 1
+            assert event_categories._cache[("Warm", 7)]["severity"] == "benign"
+            # ... and it was written through, so boot #3 needs no client at all.
+            rows = c.portal.call(app2.state.classification_store.list)
+            assert [(r["source"], r["event_id"]) for r in rows] == [("Warm", 7)]
+    finally:
+        event_categories.reset_state()

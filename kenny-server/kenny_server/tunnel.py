@@ -133,6 +133,7 @@ class AgentTunnel:
         policy_store: PolicyStore | None = None,
         webfilter: WebFilterService | None = None,
         on_agent_online: Callable[[str], Awaitable[None]] | None = None,
+        after_insert: Callable[[str, dict[str, Any]], Any] | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -146,6 +147,11 @@ class AgentTunnel:
         # tunnel to update_manager. Never awaited inline: a slow or failing hook
         # must not delay serving the connection or break the handshake.
         self.on_agent_online = on_agent_online
+        # Optional synchronous hook called with ``(agent_id, snapshot)`` right
+        # after a telemetry snapshot is stored -- the seam the persisted event
+        # classification (ADR-0058) uses to kick its background batch. Never
+        # awaited, wrapped in its own guard: ingestion does not depend on it.
+        self.after_insert = after_insert
         # request_id -> Future[Response]
         self._pending: dict[str, asyncio.Future[Response]] = {}
 
@@ -533,6 +539,12 @@ class AgentTunnel:
                     logger.exception(
                         "telemetry insert failed for %s; keeping tunnel open", frame.agent_id
                     )
+                else:
+                    if self.after_insert is not None:
+                        try:
+                            self.after_insert(frame.agent_id, snapshot)
+                        except Exception:  # noqa: BLE001 - a hook bug must not touch the tunnel
+                            logger.exception("after_insert hook failed for %s", frame.agent_id)
                     continue
                 logger.debug("telemetry from %s at %s", frame.agent_id, frame.collected_at)
             elif isinstance(frame, Log):

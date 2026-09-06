@@ -33,7 +33,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from . import health_rules
+from . import findings, health_rules
 from .registry import AgentRegistry
 from .store import EventStore, TelemetryStore
 from .tunnel import AgentTunnel, ToolError
@@ -251,7 +251,10 @@ class ScreenshotStore:
 
 
 def build_health(
-    snapshot: dict[str, Any] | None, *, agent_os: str = "windows"
+    snapshot: dict[str, Any] | None,
+    *,
+    agent_os: str = "windows",
+    now: datetime | str | None = None,
 ) -> dict[str, Any]:
     """Run health rules over a stored snapshot (or empty when none).
 
@@ -259,29 +262,64 @@ def build_health(
     :func:`health_rules.evaluate_snapshot` so a non-Windows agent's Windows-only
     sections are not scored (ADR-0031). Defaults to ``windows`` for callers that
     have no agent context, preserving prior behavior.
+
+    ``now`` is the instant the rules evaluate "as of". Callers scoring the
+    *latest* snapshot leave it unset (wall clock); callers scoring a
+    **historical** point (the fleet trend, a host's history sparkline) must
+    pass that point's ``collected_at`` -- as a datetime or the stored ISO
+    string -- because age-based rules (reliability activity, Defender's last
+    scan, OS end-of-life) would otherwise judge last month's snapshot by
+    today's date and make every old point look stale.
     """
 
     if not snapshot:
         return {"overall": "unknown", "sections": {}}
-    return health_rules.evaluate_snapshot(snapshot, agent_os=agent_os)
+    if isinstance(now, str):
+        now = health_rules.parse_ts(now)
+    return health_rules.evaluate_snapshot(snapshot, agent_os=agent_os, now=now)
+
+
+async def health_for(
+    agent_id: str,
+    snapshot: dict[str, Any] | None,
+    *,
+    agent_os: str = "windows",
+    alert_state: Any = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """``build_health`` plus the age of every finding (ADR-0058): the
+    ``since``/``age_seconds`` a non-ok section has carried its current status,
+    read from ``alert_state`` when one is wired. Without an alert-state store
+    the health is returned unaged, never with a guess."""
+
+    health = build_health(snapshot, agent_os=agent_os, now=now)
+    if alert_state is not None and health["sections"]:
+        try:
+            rows = await alert_state.get_all(agent_id)
+        except Exception:  # noqa: BLE001 - an age is a nicety, never a dependency
+            rows = {}
+        findings.stamp_age(health, rows, now=now)
+    return health
 
 
 async def agent_overview(
-    agent_id: str, registry: AgentRegistry, store: TelemetryStore
+    agent_id: str, registry: AgentRegistry, store: TelemetryStore, *, alert_state: Any = None
 ) -> dict[str, Any]:
     """One host's online/health rollup: the shape ``list_agents``/``fleet_overview``
 
     return per agent. Public (not ``_``-prefixed) because ``ticket_assistant.py``
     calls it too, to give a ticket turn's system prompt the target host's state
-    without spending a tool round-trip on it.
+    without spending a tool round-trip on it. ``flagged_sections`` are the
+    incidents (warn/crit); ``posture_sections`` the standing facts that never
+    roll up (ADR-0058).
     """
 
     agent = registry.get(agent_id)
     latest = await store.latest(agent_id)
     snapshot = latest["snapshot"] if latest else None
     agent_os = agent.os if agent else "windows"
-    health = build_health(snapshot, agent_os=agent_os)
-    flagged = [name for name, s in health["sections"].items() if s["status"] in ("warn", "crit")]
+    health = await health_for(agent_id, snapshot, agent_os=agent_os, alert_state=alert_state)
+    flagged = [name for name, s in health["sections"].items() if s["attention"]]
     return {
         "agent_id": agent_id,
         "online": bool(agent and agent.online),
@@ -289,6 +327,7 @@ async def agent_overview(
         "meta": agent.meta if agent else {},
         "overall": health["overall"],
         "flagged_sections": flagged,
+        "posture_sections": findings.posture_sections(health),
         "collected_at": latest["collected_at"] if latest else None,
     }
 
@@ -383,6 +422,7 @@ def register_tools(
     call_log: CallLog,
     webfilter: WebFilterService | None = None,
     suppression: Any = None,
+    alert_state: Any = None,
     ticket_rules: Any = None,
 ) -> None:
     """Register all MCP tools on ``mcp``."""
@@ -454,7 +494,9 @@ def register_tools(
         ids = await _known_agent_ids(registry, store)
         if principal is not None and principal.scoped:
             ids = [i for i in ids if i in principal.hosts]
-        agents = [await agent_overview(i, registry, store) for i in ids]
+        agents = [
+            await agent_overview(i, registry, store, alert_state=alert_state) for i in ids
+        ]
         return {"active_agent": registry.active_for(_active_key(principal)), "agents": agents}
 
     @mcp.tool(
@@ -488,7 +530,9 @@ def register_tools(
         ids = await _known_agent_ids(registry, store)
         if principal is not None and principal.scoped:
             ids = [i for i in ids if i in principal.hosts]
-        agents = [await agent_overview(i, registry, store) for i in ids]
+        agents = [
+            await agent_overview(i, registry, store, alert_state=alert_state) for i in ids
+        ]
         overall = health_rules.worst(*(a["overall"] for a in agents if a["overall"] != "unknown"))
         return {"overall": overall or "unknown", "agents": agents}
 
@@ -508,7 +552,9 @@ def register_tools(
 
             await annotate_snapshots([snapshot])
         agent = registry.get(id)
-        health = build_health(snapshot, agent_os=agent.os if agent else "windows")
+        health = await health_for(
+            id, snapshot, agent_os=agent.os if agent else "windows", alert_state=alert_state
+        )
         return {
             "agent_id": id,
             "collected_at": latest["collected_at"] if latest else None,

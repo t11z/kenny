@@ -33,6 +33,15 @@ const AGENT_DETAIL = {
       disk: { status: 'crit', reason: 'C: 97% full (>=95%)', summary: 'C: nearly full', attention: true },
       defender: { status: 'warn', reason: 'real-time protection off', summary: '', attention: true },
       cpu: { status: 'ok', summary: '', attention: false },
+      encryption: {
+        status: 'posture',
+        tier: 'posture',
+        reason: 'C: not BitLocker-protected',
+        summary: '',
+        attention: false,
+        since: '2026-07-01T00:00:00Z',
+        age_seconds: 31 * 86_400,
+      },
     },
   },
   governance: { supported: true },
@@ -134,5 +143,25 @@ describe('a flagged-section inbox row opens the section, not the machine', () =>
 
     expect(await screen.findByText('Disk & SMART')).toBeInTheDocument()
     expect(screen.queryByText(/· CRIT-PC$/)).not.toBeInTheDocument()
+  })
+})
+
+describe('posture sections (ADR-0058)', () => {
+  beforeEach(() => {
+    apiGetMock.mockReset()
+    apiGetMock.mockImplementation((path: string) => {
+      if (path === '/api/agent/crit-pc') return Promise.resolve(AGENT_DETAIL)
+      return Promise.resolve({})
+    })
+  })
+
+  it('lists a posture section as a standing fact with its age, not as a problem card', async () => {
+    renderAt('/fleet/crit-pc', <Route path="/fleet/:id" element={<FleetHost />} />)
+    await screen.findByText('NEEDS ATTENTION · 2 SECTIONS')
+    expect(screen.getByText('POSTURE · 1 STANDING FACT')).toBeInTheDocument()
+    expect(screen.getByText('C: not BitLocker-protected')).toBeInTheDocument()
+    expect(screen.getByText('since 31 d')).toBeInTheDocument()
+    // Not counted as healthy either.
+    expect(screen.getByText('HEALTHY · 1 SECTION')).toBeInTheDocument()
   })
 })

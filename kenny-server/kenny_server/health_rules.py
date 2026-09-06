@@ -13,18 +13,43 @@ health via worst-of.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-Status = str  # "ok" | "warn" | "crit"
+Status = str  # "ok" | "posture" | "warn" | "crit"
 
-_ORDER = {"ok": 0, "warn": 1, "crit": 2}
+# ``posture`` is a server-side verdict only (ADR-0058): a standing configuration
+# fact -- an unencrypted system drive, a remote-access port that is meant to be
+# open, an updater service that is idle by design -- that is worth listing and
+# ageing but is neither new nor time-bound, so it never alarms and never rolls
+# up into a host's overall status. It ranks with ``ok`` here on purpose:
+# :func:`worst` maps it back to ``ok`` so a host whose only findings are
+# posture is a healthy host. The wire ``Section.status`` stays
+# ``ok|warn|crit`` (``protocol.Status``); an agent can never send posture.
+_ORDER = {"ok": 0, "posture": 0, "warn": 1, "crit": 2}
+
+# Which findings alarm: a section in one of these states is an *incident*.
+INCIDENT_STATUSES: frozenset[str] = frozenset({"warn", "crit"})
 
 
 def worst(*statuses: Status) -> Status:
-    """Return the most severe of the given statuses (crit > warn > ok)."""
+    """Return the most severe of the given statuses (crit > warn > ok).
 
-    return max((s for s in statuses if s), key=lambda s: _ORDER.get(s, 0), default="ok")
+    ``posture`` never wins: it shares ``ok``'s rank and, because ``max`` keeps
+    the first of equally-ranked candidates, is mapped to ``ok`` explicitly so a
+    posture section listed first cannot leak into a roll-up.
+    """
+
+    result = max((s for s in statuses if s), key=lambda s: _ORDER.get(s, 0), default="ok")
+    return "ok" if result == "posture" else result
+
+
+def tier_of(status: Status) -> str:
+    """``incident`` (warn/crit), ``posture``, or ``none`` (ok/unknown)."""
+
+    if status in INCIDENT_STATUSES:
+        return "incident"
+    return "posture" if status == "posture" else "none"
 
 
 def _valid_status(value: Any) -> Status:
@@ -45,14 +70,20 @@ def _valid_status(value: Any) -> Status:
     return value if value in ("ok", "warn", "crit") else "warn"
 
 
-def _parse_ts(value: Any) -> datetime | None:
+def parse_ts(value: Any) -> datetime | None:
+    """Parse a stored ISO-8601 timestamp (trailing ``Z`` or offset forms);
+    ``None`` for anything else. Public so read paths can turn a snapshot's
+    ``collected_at`` into the ``now`` they evaluate history "as of"."""
+
     if not isinstance(value, str):
         return None
     try:
-        # Accept trailing Z (UTC) and offset forms.
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+_parse_ts = parse_ts
 
 
 def _dicts(value: Any) -> list[dict[str, Any]]:
@@ -88,11 +119,16 @@ def _age_days(value: Any, *, now: datetime) -> float | None:
 
 
 # A rule maps a section payload -> (status, reason) or None to defer.
-Rule = Callable[[dict[str, Any], datetime], "tuple[Status, str] | None"]
+# A rule returns ``(status, reason)`` -- or ``(status, reason, details)`` when
+# it has structured evidence worth handing to consumers verbatim (per-pattern
+# activity for ``reliability``): :func:`evaluate_section` copies ``details``
+# into the section dict so no client has to re-derive a threshold to show it.
+RuleOutcome = "tuple[Status, str] | tuple[Status, str, dict[str, Any]] | None"
+Rule = Callable[[dict[str, Any], datetime], RuleOutcome]
 # A rule that also needs the agent's OS. Listed in :data:`OS_AWARE_RULES` and
 # called with the extra argument by :func:`evaluate_section`; the OS parameter is
 # keyword-defaulted so such a rule still satisfies :data:`Rule`.
-OsAwareRule = Callable[[dict[str, Any], datetime, str], "tuple[Status, str] | None"]
+OsAwareRule = Callable[[dict[str, Any], datetime, str], RuleOutcome]
 
 
 def _rule_disk(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
@@ -128,12 +164,89 @@ def _rule_defender(payload: dict[str, Any], now: datetime) -> "tuple[Status, str
     return "ok", "Defender healthy"
 
 
-def _rule_win_update(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+# An update that keeps failing across days is an incident the machine cannot
+# resolve on its own; a single failed attempt is ordinary Windows Update noise
+# that usually clears on the next retry. Recurrence across days is the signal
+# -- never the localized title (the live fleet's are German), and never the
+# raw row count (the collector caps ``recent`` at 25, so a KB retrying every
+# four hours fills the whole list by itself).
+_WIN_UPDATE_REPEAT_ATTEMPTS_CRIT = 3
+_WIN_UPDATE_REPEAT_DAYS_CRIT = 2
+_WIN_UPDATE_STALE_CHECK_DAYS = 7
+_WIN_UPDATE_NAMED = 2
+
+
+def _rule_win_update(
+    payload: dict[str, Any], now: datetime
+) -> "tuple[Status, str, dict[str, Any]] | None":
     recent = _dicts(payload.get("recent"))
-    failed = [u for u in recent if str(u.get("result", "")).lower() == "failed"]
+    by_kb: dict[str, dict[str, Any]] = {}
+    for u in recent:
+        if str(u.get("result", "")).lower() != "failed":
+            continue
+        key = str(u.get("kb") or u.get("title") or "?")
+        at = _parse_ts(u.get("installed_at"))
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        row = by_kb.setdefault(
+            key,
+            {"kb": key, "title": str(u.get("title") or ""), "attempts": 0, "days": set(),
+             "first_failed": None, "last_failed": None},
+        )
+        row["attempts"] += 1
+        if at is not None:
+            row["days"].add(at.date().isoformat())
+            if row["first_failed"] is None or at < row["first_failed"]:
+                row["first_failed"] = at
+            if row["last_failed"] is None or at > row["last_failed"]:
+                row["last_failed"] = at
+
+    failed = sorted(by_kb.values(), key=lambda r: (-r["attempts"], r["kb"]))
+    details = {
+        "failed": [
+            {
+                "kb": r["kb"],
+                "title": r["title"],
+                "attempts": r["attempts"],
+                "days": len(r["days"]),
+                "first_failed": r["first_failed"].isoformat() if r["first_failed"] else None,
+                "last_failed": r["last_failed"].isoformat() if r["last_failed"] else None,
+            }
+            for r in failed
+        ]
+    }
+    repeating = [
+        r
+        for r in failed
+        if r["attempts"] >= _WIN_UPDATE_REPEAT_ATTEMPTS_CRIT
+        and len(r["days"]) >= _WIN_UPDATE_REPEAT_DAYS_CRIT
+    ]
+
+    last_check = _parse_ts(payload.get("last_check"))
+    if last_check is not None and last_check.tzinfo is None:
+        last_check = last_check.replace(tzinfo=timezone.utc)
+    stale_days = (now - last_check).days if last_check is not None else None
+
+    def _describe(r: dict[str, Any]) -> str:
+        text = f"{r['kb']} failed {r['attempts']}×"
+        if r["first_failed"]:
+            text += f" since {r['first_failed'].date().isoformat()}"
+        if r["last_failed"]:
+            hours = max(0.0, (now - r["last_failed"]).total_seconds() / 3600)
+            text += f" (last {_age_label(hours)} ago)"
+        return text
+
     if failed:
-        return "warn", f"{len(failed)} update(s) failed"
-    return "ok", "Updates healthy"
+        named = (repeating or failed)[:_WIN_UPDATE_NAMED]
+        reason = ", ".join(_describe(r) for r in named)
+        extra = len(failed) - len(named)
+        if extra > 0:
+            reason += f", +{extra} more"
+        status: Status = "crit" if repeating else "warn"
+        return status, reason, details
+    if stale_days is not None and stale_days >= _WIN_UPDATE_STALE_CHECK_DAYS:
+        return "warn", f"no update check for {stale_days}d", details
+    return "ok", "Updates healthy", details
 
 
 def _rule_reboot_pending(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
@@ -203,239 +316,279 @@ def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-# -- reliability: volume-based fallback (no severity annotation present) ----
+# -- reliability: activity- and persistence-based pattern scoring ------------
 #
-# Used only when events carry no `severity` field at all — i.e. the read-path
-# LLM categorization (ADR-0026) has never run over this payload (a raw agent
-# snapshot, or a test payload built by hand). Kept as today's thresholds, plus
-# one addition (a distinct-pattern escalation) so this path is never *less*
-# sensitive than the original volume-based rule — see _rule_reliability_by_volume.
-_RELIABILITY_FALLBACK_CRIT_TOTAL = 50
-_RELIABILITY_FALLBACK_WARN_TOTAL = 15
-# This many distinct (source, event_id) patterns, even if each is individually
-# low-count, is itself a signal worth a look when there's no severity info to
-# tell benign repetition from real diversity.
-_RELIABILITY_FALLBACK_WARN_DISTINCT = 8
-
-# -- reliability: weighted-pattern scoring (severity annotation present) ----
+# Score on WHETHER a pattern is still happening and on WHAT it is -- never on
+# how many lines it produced. A reboot storm that wrote 80 identical DCOM
+# errors on one day a week ago is history; one app crash is a one-off; a
+# pattern that fires on five of the last seven days and was last seen an hour
+# ago is an incident. The agent already sends the evidence for this
+# (``by_day`` per pattern, ``last_seen``, ``window_days`` -- see
+# ``docs/protocol.md``); the constants below turn it into three per-pattern
+# booleans (``active``, ``recurring``, ``burst``) that the verdict and the
+# reason read. There is deliberately no count threshold anywhere in this
+# rule: counts cannot tell "3439 identical harmless lines" from "3439
+# individually relevant errors" (ADR-0041), and a distinct-pattern count
+# cannot tell a reboot storm from a machine that is falling apart (ADR-0058).
 #
-# Score on WHAT is recurring, not how often. A single benign pattern
-# repeating hundreds of times must not out-rank a handful of distinct,
-# unclassified or serious ones.
-_RELIABILITY_SERIOUS_RECURRENCE_CRIT = 10  # one 'serious' pattern this often -> crit alone
-_RELIABILITY_SIGNIFICANT_PATTERNS_CRIT = 5  # this many distinct non-benign patterns -> crit
+# A pattern is *active* if it was seen within this many hours of ``now`` ...
+_RELIABILITY_ACTIVE_WITHIN_HOURS = 48
+# ... or, as long as its last hit is still inside the window, on at least this
+# many distinct days of it (a pattern that fires most days is a fixture of the
+# machine even if the last push happened to land in a lull).
+_RELIABILITY_ACTIVE_MIN_DAYS = 3
+# A pattern is *recurring* once it has been seen on this many distinct days.
+# Below this it is a one-off, whatever its count.
+_RELIABILITY_RECURRING_MIN_DAYS = 2
+# A pattern is a *burst* when one day holds at least this share of its total
+# and it is not active any more -- the shape of a reboot storm or a single
+# bad afternoon, as opposed to a standing problem.
+_RELIABILITY_BURST_SHARE = 0.8
+# How many scoring patterns the reason names before folding the rest.
+_RELIABILITY_NAMED_PATTERNS = 3
 
-# Shared by both scoring paths: the Windows Reliability Index (0-10) is an
-# independent, agent-computed signal that content-based pattern scoring can't
-# see into, so it always applies on top. It is deliberately NOT suppressible —
-# an operator muting a noisy event pattern must never be able to hide a
-# genuinely low reliability index (issue #166 / ADR-0041).
+# The Windows Reliability Index (0-10) is an independent, agent-computed
+# signal that content-based pattern scoring can't see into, so it always
+# applies on top. It is deliberately NOT suppressible -- an operator muting a
+# noisy event pattern must never be able to hide a genuinely low reliability
+# index (issue #166 / ADR-0041).
 _RELIABILITY_SI_CRIT = 3
 _RELIABILITY_SI_WARN = 6
 
+_RELIABILITY_SEVERITIES = ("benign", "notable", "serious", "unknown")
 
-def _reliability_reason(events: list[Any], total: int) -> str:
-    """A content reason: the biggest problem groups by category (or raw source).
 
-    Used for the volume-based fallback path, where there is no severity/cause
-    to name — see :func:`_reliability_pattern_reason` for the annotated path.
-    Suppressed groups (ADR-0041) are excluded from the tally — a muted pattern
-    must not out-rank the events that still matter — and counted in a trailing
-    note instead, so an operator can tell "quiet" from "quieted".
+def _reliability_by_day(value: Any) -> dict[str, int]:
+    """Coerce an untrusted ``by_day`` histogram to ``{YYYY-MM-DD: count>0}``."""
+
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, int] = {}
+    for day, count in value.items():
+        n = _number(count)
+        if isinstance(day, str) and n is not None and n > 0:
+            out[day] = int(n)
+    return out
+
+
+def _reliability_day_age_hours(day: str, now: datetime) -> float | None:
+    """Hours from the *end* of calendar day ``day`` (UTC) to ``now``."""
+
+    try:
+        end = datetime.fromisoformat(day).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    except ValueError:
+        return None
+    return max(0.0, (now - end).total_seconds() / 3600)
+
+
+def reliability_patterns(payload: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+    """Derive one activity/persistence record per reliability event group.
+
+    Pure and non-mutating: the ``events`` list is shared with the dashboard's
+    heatmap and the fleet aggregation, which must keep seeing the raw groups
+    the agent sent. Every field is JSON-safe so the result can travel in a
+    section's ``details`` (see :func:`evaluate_section`). Fields:
+
+    ``source``, ``event_id``, ``level``, ``count``, ``category``, ``cause``,
+    ``suppressed`` -- copied from the group (ADR-0026 / ADR-0041 read-path
+    annotations); ``severity`` -- the LLM's verdict, ``unknown`` when absent
+    or unrecognized, forced to ``serious`` for a Windows-critical group unless
+    the operator suppressed that exact pattern (explicit intent overrides the
+    automatic escalation, otherwise a suppressed Kernel-Power/41 could never
+    be muted); ``active_days``, ``first_day``, ``last_day`` -- from ``by_day``;
+    ``last_seen_age_hours`` -- from ``last_seen`` against ``now`` (falls back
+    to the end of ``last_day``); ``active``, ``recurring``, ``burst`` -- the
+    three booleans the verdict reads, defined by the module constants above.
+    All three are relative to ``now``: the same payload judged well after its
+    window has passed is history, which is why history reads evaluate "as of"
+    the snapshot's own ``collected_at``.
     """
 
-    tally: dict[str, int] = {}
-    suppressed_n = 0
-    for e in events or []:
-        if not isinstance(e, dict):
-            continue
-        if e.get("suppressed"):
-            suppressed_n += 1
-            continue
-        label = e.get("category") or e.get("source") or "?"
-        tally[label] = tally.get(label, 0) + int(_number(e.get("count")) or 0)
-    top = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)[:3]
-    suffix = f" ({suppressed_n} pattern(s) suppressed)" if suppressed_n else ""
-    if not top:
-        return f"{total} error/critical events in 7d{suffix}"
-    return ", ".join(f"{label} ×{count}" for label, count in top) + suffix
-
-
-def _cadence_label(count: int, window_days: Any) -> str:
-    """A short, deterministic cadence label from count/window (e.g. '~43/day')."""
-
-    days = _number(window_days) or 7.0
-    if days <= 0 or count <= 0:
-        return f"{count} total"
-    per_day = count / days
-    if per_day >= 1:
-        return f"~{per_day:.0f}/day"
-    return f"~{per_day * 7:.1f}/week"
-
-
-def _reliability_pattern_reason(patterns: list[dict[str, Any]], total: int, window_days: Any) -> str:
-    """Name the dominant *significant* pattern — source/event id, cadence, and
-    the LLM's suspected cause — so a reader can judge severity from
-    ``agent_health`` alone, without a manual ``diag_eventlog`` call. A host
-    whose events are all known-benign says so explicitly instead of hiding the
-    count behind a scary number.
-
-    Suppressed patterns (ADR-0041 / issue #166) are never named here — that is
-    the whole point of muting them — but their existence is always noted in a
-    trailing clause, so the reader can tell "quiet" from "quieted". A pattern
-    the operator muted is never folded into "known-benign": that phrase is the
-    LLM's verdict, and a suppression is the operator's, a different claim.
-    """
-
-    suppressed = [p for p in patterns if p.get("suppressed")]
-    scored = [p for p in patterns if not p.get("suppressed")]
-    suffix = f" ({len(suppressed)} pattern(s) suppressed)" if suppressed else ""
-
-    significant = [p for p in scored if p["severity"] != "benign"]
-    if not significant:
-        if not patterns:
-            return f"{total} error/critical events in 7d"
-        if not scored:
-            return f"{total} events, all {len(suppressed)} pattern(s) suppressed"
-        by_category: dict[str, int] = {}
-        for p in scored:
-            label = p.get("category") or "?"
-            by_category[label] = by_category.get(label, 0) + p["count"]
-        top_cat = max(by_category, key=lambda c: by_category[c])
-        return f"{total} events, all known-benign ({top_cat}){suffix}"
-
-    significant.sort(key=lambda p: p["count"], reverse=True)
-    top = significant[0]
-    label = str(top.get("source") or "?")
-    if top.get("event_id") is not None:
-        label += f"/{top['event_id']}"
-    cadence = _cadence_label(top["count"], window_days)
-    cause = top.get("cause") or top.get("category") or "cause unclear"
-    reason = f"{label} ×{top['count']} ({cadence}) — {cause}"
-    extra = len(significant) - 1
-    if extra > 0:
-        reason += f", +{extra} more pattern(s)"
-    return reason + suffix
-
-
-def _rule_reliability_by_volume(
-    events: list[dict[str, Any]], total_i: int, si: float | None
-) -> "tuple[Status, str]":
-    """Fallback scoring when events carry no severity annotation (see module
-    comment above). Strictly at least as sensitive as the original volume-based rule.
-
-    Operator suppression (ADR-0041 / issue #166) still applies on this path.
-    Unlike the ADR-0026 LLM categorization, matching a suppression rule needs
-    no LLM and no API key, so it is available here too — and this is the path
-    that drives push alerting, the weekly digest, and the fleet list, which is
-    exactly where a single dominant noisy pattern is loudest (see the module
-    that installs the ``TelemetryStore.annotate`` hook). Suppressed volume is
-    subtracted from the SCORING total only; the raw ``total_i`` used in the
-    displayed reason (and ``recent_crashes`` itself) is untouched.
-    """
-
-    scored_events = [e for e in events if not e.get("suppressed")]
-    suppressed_total = sum(
-        int(_number(e.get("count")) or 0) for e in events if e.get("suppressed")
-    )
-    scored_total = max(0, total_i - suppressed_total)
-    has_critical = any(e.get("level") == "critical" for e in scored_events)
-    distinct = len({(e.get("source"), e.get("event_id")) for e in scored_events})
-
-    if scored_total >= _RELIABILITY_FALLBACK_CRIT_TOTAL or (si is not None and si < _RELIABILITY_SI_CRIT):
-        status: Status = "crit"
-    elif (
-        scored_total >= _RELIABILITY_FALLBACK_WARN_TOTAL
-        or has_critical
-        or distinct >= _RELIABILITY_FALLBACK_WARN_DISTINCT
-        or (si is not None and si < _RELIABILITY_SI_WARN)
-    ):
-        status = "warn"
-    else:
-        status = "ok"
-
-    return status, _reliability_reason(events, total_i)
-
-
-def _rule_reliability_by_severity(
-    events: list[dict[str, Any]], total_i: int, si: float | None, window_days: Any
-) -> "tuple[Status, str]":
-    """Weighted-pattern scoring once events carry a server-annotated severity
-    (ADR-0026 read-path categorization). Distinct *patterns* drive escalation,
-    not raw volume — see the module comment above.
-    """
-
-    patterns: list[dict[str, Any]] = []
+    events_raw = payload.get("events")
+    events = [e for e in events_raw if isinstance(e, dict)] if isinstance(events_raw, list) else []
+    window_hours = (_number(payload.get("window_days")) or 7.0) * 24
+    out: list[dict[str, Any]] = []
     for e in events:
         severity = e.get("severity")
-        if severity not in ("benign", "notable", "serious", "unknown"):
+        if severity not in _RELIABILITY_SEVERITIES:
             severity = "unknown"
         suppressed = bool(e.get("suppressed"))
         if e.get("level") == "critical" and not suppressed:
-            # A Windows-critical entry always counts as serious, regardless of
-            # what the LLM made of the message -- unless the operator has
-            # explicitly suppressed this exact pattern (ADR-0041 / issue #166),
-            # in which case that explicit intent overrides the automatic
-            # escalation. Without this, a suppressed Kernel-Power/41 could
-            # never actually be muted.
             severity = "serious"
-        patterns.append(
+        count = int(_number(e.get("count")) or 0)
+        by_day = _reliability_by_day(e.get("by_day"))
+        days = sorted(by_day)
+        first_day = days[0] if days else None
+        last_day = days[-1] if days else None
+
+        last_seen = _parse_ts(e.get("last_seen"))
+        if last_seen is not None and last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        age: float | None
+        if last_seen is not None:
+            age = max(0.0, (now - last_seen).total_seconds() / 3600)
+        elif last_day is not None:
+            age = _reliability_day_age_hours(last_day, now)
+        else:
+            age = None
+
+        recent = age is not None and age <= _RELIABILITY_ACTIVE_WITHIN_HOURS
+        in_window = age is not None and age <= window_hours
+        active_days = len(days)
+        peak = max(by_day.values(), default=0)
+        out.append(
             {
                 "source": e.get("source"),
                 "event_id": e.get("event_id"),
-                "count": int(_number(e.get("count")) or 0),
+                "level": e.get("level"),
+                "count": count,
                 "severity": severity,
                 "category": e.get("category"),
                 "cause": e.get("suspected_cause"),
                 "suppressed": suppressed,
+                "active_days": active_days,
+                "first_day": first_day,
+                "last_day": last_day,
+                "last_seen_age_hours": round(age, 1) if age is not None else None,
+                "active": recent or (in_window and active_days >= _RELIABILITY_ACTIVE_MIN_DAYS),
+                "recurring": active_days >= _RELIABILITY_RECURRING_MIN_DAYS,
+                "burst": (count > 0 and peak / count >= _RELIABILITY_BURST_SHARE and not recent),
             }
         )
+    return out
 
-    # Suppressed patterns stay in `patterns` (so they're still counted and
-    # reportable) but are excluded from every scoring list below.
+
+def _age_label(hours: float) -> str:
+    if hours < 1:
+        return "<1h"
+    if hours < 48:
+        return f"{hours:.0f}h"
+    return f"{hours / 24:.0f}d"
+
+
+def _reliability_describe(p: dict[str, Any], window_days: int) -> str:
+    label = str(p.get("source") or "?")
+    if p.get("event_id") is not None:
+        label += f"/{p['event_id']}"
+    bits = [f"{label} ×{p['count']}"]
+    if p["active_days"]:
+        bits.append(f"{p['active_days']} of {window_days} days")
+    if p["last_seen_age_hours"] is not None:
+        bits.append(f"last seen {_age_label(p['last_seen_age_hours'])} ago")
+    cause = p.get("cause") or p.get("category") or "cause unclear"
+    return ", ".join(bits) + f" — {cause}"
+
+
+def _reliability_scoring(patterns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The patterns that drive the verdict, most important first: active
+    serious, then quiet serious, then active-and-recurring notable/unknown;
+    by count within each group. Suppressed patterns never score."""
+
     scored = [p for p in patterns if not p["suppressed"]]
-    serious = [p for p in scored if p["severity"] == "serious"]
-    # "unknown" is deliberately included here — never silently treated as
-    # benign — so genuinely novel/unclassifiable errors keep surfacing. Only an
-    # explicit operator suppression rule removes a pattern from this list.
-    significant = [p for p in scored if p["severity"] != "benign"]
-    worst_serious_count = max((p["count"] for p in serious), default=0)
 
-    if (
-        worst_serious_count >= _RELIABILITY_SERIOUS_RECURRENCE_CRIT
-        or len(significant) >= _RELIABILITY_SIGNIFICANT_PATTERNS_CRIT
-        or (si is not None and si < _RELIABILITY_SI_CRIT)
-    ):
-        status: Status = "crit"
-    elif significant or (si is not None and si < _RELIABILITY_SI_WARN):
-        status = "warn"
-    else:
-        status = "ok"
+    def _rank(p: dict[str, Any]) -> int | None:
+        if p["severity"] == "serious":
+            return 0 if p["active"] else 1
+        if p["severity"] in ("notable", "unknown") and p["active"] and p["recurring"]:
+            return 2
+        return None
 
-    return status, _reliability_pattern_reason(patterns, total_i, window_days)
+    ranked = [(r, p) for p in scored if (r := _rank(p)) is not None]
+    ranked.sort(key=lambda rp: (rp[0], -rp[1]["count"]))
+    return [p for _, p in ranked]
 
 
-def _rule_reliability(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+def _reliability_reason(
+    patterns: list[dict[str, Any]], scoring: list[dict[str, Any]], total: int, window_days: int
+) -> str:
+    """A finding-shaped reason: the patterns that score, each with cadence,
+    persistence and age, then the historical remainder folded into one clause.
+
+    Never leads with the raw 7-day total -- "3528 error/critical events" is a
+    number without a decision in it. Suppressed patterns (ADR-0041) are never
+    named -- that is the point of muting them -- but always counted in the
+    trailing clause, so a reader can tell "quiet" from "quieted". A pattern
+    the operator muted is never folded into "known-benign": that phrase is
+    the LLM's verdict, a suppression is the operator's, a different claim.
+    """
+
+    suppressed = [p for p in patterns if p["suppressed"]]
+    scored = [p for p in patterns if not p["suppressed"]]
+    suffix = f" ({len(suppressed)} pattern(s) suppressed)" if suppressed else ""
+
+    if not patterns:
+        return (
+            f"no error patterns in {window_days}d"
+            if total == 0
+            else f"{total} events, no patterns reported"
+        )
+    if not scored:
+        return f"{total} events, all {len(suppressed)} pattern(s) suppressed"
+
+    scoring_ids = {id(p) for p in scoring}
+    historical = [p for p in scored if id(p) not in scoring_ids and p["severity"] != "benign"]
+    quiet_since = max((p["last_day"] for p in historical if p["last_day"]), default=None)
+    historical_clause = f"{len(historical)} historical pattern(s)"
+    if quiet_since:
+        historical_clause += f" quiet since {quiet_since}"
+
+    if not scoring:
+        if not historical:
+            by_category: dict[str, int] = {}
+            for p in scored:
+                label = p.get("category") or "?"
+                by_category[label] = by_category.get(label, 0) + p["count"]
+            top_cat = max(by_category, key=lambda c: by_category[c])
+            return f"{total} events, all known-benign ({top_cat}){suffix}"
+        benign_n = len(scored) - len(historical)
+        reason = f"no active error patterns; {historical_clause}"
+        if benign_n:
+            reason += f", {benign_n} known-benign"
+        return reason + suffix
+
+    named = scoring[:_RELIABILITY_NAMED_PATTERNS]
+    reason = ", ".join(_reliability_describe(p, window_days) for p in named)
+    extra = len(scoring) - len(named)
+    if extra > 0:
+        reason += f", +{extra} more active pattern(s)"
+    if historical:
+        reason += f", {historical_clause}"
+    return reason + suffix
+
+
+def _rule_reliability(
+    payload: dict[str, Any], now: datetime
+) -> "tuple[Status, str, dict[str, Any]] | None":
     # `events` is the grouped Error/Critical breakdown; `stability_index` is the
-    # Windows Reliability Index (0-10). Once the read path has annotated each
-    # group with a `severity` (ADR-0026 categorization),
-    # score on WHAT is recurring — see _rule_reliability_by_severity. Without
-    # that annotation (e.g. a raw payload in a unit test) fall back to the
-    # original volume-based thresholds — see _rule_reliability_by_volume.
+    # Windows Reliability Index (0-10). Per-pattern activity is derived from the
+    # `by_day`/`last_seen` fields the agent sends, severity from the ADR-0026
+    # annotation (persisted server-side, ADR-0058) -- one scoring path for every
+    # consumer. Without any annotation every pattern is `unknown`, which can
+    # reach warn but never crit: a count alone is never a critical finding.
     events_raw = payload.get("events")
-    events = [e for e in events_raw if isinstance(e, dict)] if isinstance(events_raw, list) else []
     si = _number(payload.get("stability_index"))
     total = _number(payload.get("recent_crashes"))
     if events_raw is None and total is None and si is None:
         return None
-    if total is None:
-        total = sum(int(_number(e.get("count")) or 0) for e in events)
-    total_i = int(total)
 
-    annotated = any("severity" in e for e in events)
-    if annotated:
-        return _rule_reliability_by_severity(events, total_i, si, payload.get("window_days"))
-    return _rule_reliability_by_volume(events, total_i, si)
+    patterns = reliability_patterns(payload, now)
+    if total is None:
+        total = sum(p["count"] for p in patterns)
+    total_i = int(total)
+    window_days = int(_number(payload.get("window_days")) or 7)
+
+    scoring = _reliability_scoring(patterns)
+    serious_active = any(p["severity"] == "serious" and p["active"] for p in scoring)
+
+    if serious_active or (si is not None and si < _RELIABILITY_SI_CRIT):
+        status: Status = "crit"
+    elif scoring or (si is not None and si < _RELIABILITY_SI_WARN):
+        status = "warn"
+    else:
+        status = "ok"
+
+    reason = _reliability_reason(patterns, scoring, total_i, window_days)
+    return status, reason, {"patterns": patterns, "window_days": window_days}
 
 
 _WEB_ACTIVITY_SERIOUS = {"custom", "seed", "external_adult"}
@@ -476,9 +629,13 @@ def _rule_listening_ports(payload: dict[str, Any], now: datetime) -> "tuple[Stat
         and not str(p.get("address", "")).startswith(("127.", "::1"))
     ]
     if exposed:
+        # A remote-access listener is a standing fact about how the machine is
+        # set up -- RDP on an admin PC, sshd on a server -- not an event. It is
+        # listed and aged as posture; a port that *appears* is caught by the
+        # inventory diff (diffs.py) as a change notification.
         e = exposed[0]
         example = f"{e.get('proto', '?')}/{e.get('port', '?')} {e.get('process', '?')}"
-        return "warn", f"{len(exposed)} remote-access port(s) listening (e.g. {example})"
+        return "posture", f"{len(exposed)} remote-access port(s) listening (e.g. {example})"
     return None
 
 
@@ -602,6 +759,120 @@ def _rule_net_quality(payload: dict[str, Any], now: datetime) -> "tuple[Status, 
     return None
 
 
+# -- sections the agent used to grade itself (ADR-0058) ------------------------
+#
+# ``services``, ``encryption``, ``printers``, ``time_sync`` and ``uptime`` carried
+# only the collector's own verdict, which this module could never lower -- the
+# bug class ``reliability`` was cured of first. Each now has a rule here and
+# the collectors report without grading. Most of what they report is posture:
+# a fact about how the machine is configured that is true today exactly as it
+# was yesterday, and that no operator wants to be told about every day.
+
+_SERVICES_NAMED = 3
+
+
+def _rule_services(
+    payload: dict[str, Any], now: datetime, agent_os: str = "windows"
+) -> "tuple[Status, str] | None":
+    services = _dicts(payload.get("services"))
+    if not services:
+        return None  # nothing reported (probe failed, or no failed units on Linux)
+    if _is_windows(agent_os):
+        # Auto-start services that are not running are, on a real PC, almost
+        # always trigger-start and updater services idling by design (Edge and
+        # Google updaters, sppsvc, gpsvc, MapsBroker ...). That is posture: worth
+        # a list, never an alarm. A service that *fails* announces itself as
+        # Service Control Manager events in `reliability`, scored by activity.
+        stalled = [
+            str(svc.get("name") or svc.get("display") or "?")
+            for svc in services
+            if str(svc.get("start") or "").lower().startswith("auto")
+            and str(svc.get("status") or "").lower() != "running"
+        ]
+        if not stalled:
+            return "ok", f"{len(services)} services, all auto-start running"
+        example = ", ".join(stalled[:_SERVICES_NAMED])
+        extra = len(stalled) - _SERVICES_NAMED
+        suffix = f", +{extra} more" if extra > 0 else ""
+        return "posture", f"{len(stalled)} auto-start service(s) not running (e.g. {example}{suffix})"
+    # Linux reports failed systemd units only; a failed unit is an incident.
+    failed = [
+        str(svc.get("name") or "?")
+        for svc in services
+        if str(svc.get("status") or "").lower() == "failed"
+    ]
+    if failed:
+        example = ", ".join(failed[:_SERVICES_NAMED])
+        return "warn", f"{len(failed)} failed unit(s) (e.g. {example})"
+    return "ok", "all units healthy"
+
+
+def _rule_encryption(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+    volumes = _dicts(payload.get("volumes"))
+    if not volumes:
+        return None  # BitLocker state unavailable -> defer, never "encrypted"
+    system = next(
+        (v for v in volumes if str(v.get("mount") or "").rstrip("\\").upper() == "C:"),
+        volumes[0],
+    )
+    mount = str(system.get("mount") or "C:").rstrip("\\").upper()
+    if system.get("protection_status") == 1:
+        return "ok", "system drive encrypted"
+    return "posture", f"{mount} not BitLocker-protected"
+
+
+def _rule_printers(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+    printers = _dicts(payload.get("printers"))
+    if not printers:
+        return None
+    bad = [
+        str(p.get("name") or "?")
+        for p in printers
+        if any(word in str(p.get("status") or "").lower() for word in ("error", "offline"))
+    ]
+    if not bad:
+        return "ok", f"{len(printers)} printer(s) OK"
+    # An offline printer is neither an incident nor posture: it is a fact
+    # about a peripheral that is switched off, visible in the section, and
+    # not a finding about the machine.
+    return "ok", f"{len(bad)} of {len(printers)} printer(s) offline/error ({', '.join(bad[:2])})"
+
+
+_TIME_SYNC_MAX_OFFSET_SECS = 5.0
+
+
+def _rule_time_sync(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+    synchronized = payload.get("synchronized")
+    offset = _number(payload.get("offset_secs"))
+    if synchronized is None and offset is None:
+        # No reading (time service not queryable, or a platform without one):
+        # the agent's summary says which, and an unknown is not a finding.
+        return None
+    if offset is not None and abs(offset) > _TIME_SYNC_MAX_OFFSET_SECS:
+        return "warn", f"clock offset {offset:.2f}s"
+    if synchronized is False:
+        return "warn", "clock not network-synchronized"
+    return "ok", "clock synchronized"
+
+
+_UPTIME_POSTURE_SECS = 30 * 24 * 3600
+
+
+def _rule_uptime(
+    payload: dict[str, Any], now: datetime, agent_os: str = "windows"
+) -> "tuple[Status, str] | None":
+    secs = _number(payload.get("uptime_secs"))
+    if secs is None:
+        return None
+    days = int(secs // 86_400)
+    if _is_windows(agent_os) and secs >= _UPTIME_POSTURE_SECS:
+        # Windows applies updates on reboot; a month without one means
+        # patches are waiting. Standing fact, not an event: posture.
+        return "posture", f"up {days}d — Windows updates need a reboot to apply"
+    # Long uptime on a Linux server is not a finding.
+    return "ok", f"up {days}d"
+
+
 # Section name -> rule. Easy to extend: add an entry.
 RULES: dict[str, Rule | OsAwareRule] = {
     "disk": _rule_disk,
@@ -619,6 +890,11 @@ RULES: dict[str, Rule | OsAwareRule] = {
     "logon_failures": _rule_logon_failures,
     "backup_status": _rule_backup_status,
     "net_quality": _rule_net_quality,
+    "services": _rule_services,
+    "encryption": _rule_encryption,
+    "printers": _rule_printers,
+    "time_sync": _rule_time_sync,
+    "uptime": _rule_uptime,
 }
 
 
@@ -632,18 +908,30 @@ RULES: dict[str, Rule | OsAwareRule] = {
 # (sshd/PAM failures from the journal). Its thresholds are OS-neutral, so it is
 # now scored everywhere.
 WINDOWS_ONLY_SECTIONS: frozenset[str] = frozenset(
-    {"defender", "win_update", "reboot_pending", "backup_status"}
+    {"defender", "win_update", "reboot_pending", "backup_status", "encryption"}
 )
 
 # Sections whose *rule* needs to know the agent's OS, as opposed to sections that
 # are skipped wholesale. Kept as a separate registry rather than widening every
-# rule's signature: exactly one rule needs this today, and an explicit list is
-# greppable in a way an inspected signature is not.
-OS_AWARE_RULES: frozenset[str] = frozenset({"local_accounts"})
+# rule's signature: an explicit list is greppable in a way an inspected
+# signature is not.
+OS_AWARE_RULES: frozenset[str] = frozenset({"local_accounts", "services", "uptime"})
 
 
 def _is_windows(agent_os: str | None) -> bool:
     return str(agent_os or "windows").lower() == "windows"
+
+
+def _agent_verdict(reported: Status, summary: str) -> dict[str, Any]:
+    """The section dict when this module has nothing to say and the agent's
+    own ``status`` stands (no rule, or a rule that deferred)."""
+
+    return {
+        "status": reported,
+        "summary": summary,
+        "attention": reported in INCIDENT_STATUSES,
+        "tier": tier_of(reported),
+    }
 
 
 def evaluate_section(
@@ -653,15 +941,17 @@ def evaluate_section(
     now: datetime | None = None,
     agent_os: str = "windows",
 ) -> dict[str, Any]:
-    """Return ``{status, summary, attention, reason?}`` for one section after
-    applying rules.
+    """Return ``{status, summary, attention, tier, reason?, details?}`` for
+    one section after applying rules.
 
-    ``attention`` is ``status != "ok"`` — computed here, alongside ``status``,
+    ``attention`` is ``status in {warn, crit}`` and ``tier`` is
+    ``incident``/``posture``/``none`` — computed here, alongside ``status``,
     and nowhere else (``kenny-server/CLAUDE.md``: "health thresholds live only
     in health_rules.py"). Every consumer (``tools.build_health``,
     ``fleet_stats``, the dashboard's ``_overview``, the MCP ``agent_health``
-    tool) reads it straight off this dict rather than re-deriving it from
-    ``status``.
+    tool) reads them straight off this dict rather than re-deriving them from
+    ``status``. A ``posture`` section is not ``attention``: it is listed and
+    aged, never alarmed on (ADR-0058).
 
     **A rule's verdict is final, not a floor over the agent's own.** When a
     section has a rule and that rule reaches a verdict, that verdict *is* the
@@ -686,19 +976,23 @@ def evaluate_section(
     summary = payload.get("summary", "")
     rule = RULES.get(name)
     if rule is None:
-        return {"status": reported, "summary": summary, "attention": reported != "ok"}
+        return _agent_verdict(reported, summary)
     outcome = (
         rule(payload, now, agent_os) if name in OS_AWARE_RULES else rule(payload, now)
     )
     if outcome is None:
-        return {"status": reported, "summary": summary, "attention": reported != "ok"}
-    rule_status, reason = outcome
-    return {
+        return _agent_verdict(reported, summary)
+    rule_status, reason = outcome[0], outcome[1]
+    result: dict[str, Any] = {
         "status": rule_status,
         "summary": summary,
-        "attention": rule_status != "ok",
+        "attention": rule_status in INCIDENT_STATUSES,
+        "tier": tier_of(rule_status),
         "reason": reason,
     }
+    if len(outcome) > 2 and isinstance(outcome[2], dict):
+        result["details"] = outcome[2]
+    return result
 
 
 def evaluate_snapshot(

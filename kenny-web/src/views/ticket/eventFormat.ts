@@ -54,8 +54,6 @@ export const TRIAGE_VERDICTS = [
   'inconclusive',
 ] as const
 
-export type TriageVerdict = (typeof TRIAGE_VERDICTS)[number]
-
 /**
  * How a verdict reads at a glance. Three colours, not five: the only
  * distinction the reader acts on is "nothing to do" / "your turn" / "nobody

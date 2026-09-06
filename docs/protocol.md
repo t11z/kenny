@@ -603,6 +603,12 @@ Each section payload **must** include `status` ∈ {`ok`, `warn`, `crit`} and a 
 **Security & crypto:** `firewall`, `encryption`, `av_thirdparty`, `defender_quarantine`.
 **Update & stability:** `reboot_pending`, `os_support`, `reliability`, `app_updates`.
 **Operations & daily:** `uptime`, `time_sync`, `printers`, `wifi_quality`, `autostart`.
+
+Five of these sections **report without grading**, like `reliability` and the inventory
+sections below: `services`, `encryption`, `printers`, `time_sync` and `uptime` always carry
+`status: "ok"`, and the server's health rules are authoritative for them (ADR-0058). The
+raw fields are unchanged; only the collector's own verdict is gone, so a server-side rule
+can relax a section as well as tighten it.
 **Parental controls:** `web_activity`, `screen_time`.
 **Security inventory:** `installed_software`, `browser_extensions`, `listening_ports`,
 `scheduled_tasks`, `local_accounts`.
@@ -674,8 +680,12 @@ volume. If the operator has suppressed this exact `(source, event_id)` pattern (
 read path additionally stamps `suppressed: true` and a `suppressed_by` descriptor, excluding
 the group from severity scoring while leaving its count untouched; unlike the LLM annotation
 above, suppression needs no API key and so is stamped on every read path, including
-`agent_snapshot`. These fields are all **server-internal and not part of this wire
-contract** — the agent never sends them (see ADR-0026, ADR-0041). Off Windows the section is
+`agent_snapshot`. The server persists its `category`/`severity`/`suspected_cause` verdicts
+and stamps them on every read path too, and its health rule derives each group's activity
+(days active, age of `last_seen`, whether it is still happening) from the `by_day` and
+`last_seen` fields above — that derived record appears only in health output, never on the
+wire. These fields are all **server-internal and not part of this wire contract** — the
+agent never sends them (see ADR-0026, ADR-0041, ADR-0058). Off Windows the section is
 the `n/a on this platform` stub with `events: []`.
 
 ### Security-inventory, resilience, and parental-awareness sections (v0.10)

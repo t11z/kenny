@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, AsyncIterator
 
 from fastmcp import FastMCP
@@ -26,7 +27,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.routing import Mount, Route, WebSocketRoute
 
-from . import agent_release
+from . import agent_release, event_categories
 from .alerting import AlertEngine
 from .config import Settings
 from .auth import (
@@ -53,6 +54,7 @@ from .store import (
     AlertStateStore,
     BackupTargetStore,
     ChatHistoryStore,
+    EventClassificationStore,
     EventStore,
     PolicyStore,
     ReliabilitySuppressionStore,
@@ -299,7 +301,14 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
     # reliability_suppression.py.
     suppression_store = ReliabilitySuppressionStore(db_path)
     suppression = SuppressionList(suppression_store)
-    store.annotate = suppression.mark
+    # Persisted LLM event classification (ADR-0026 made durable by ADR-0058):
+    # the verdicts ride the same read-path seam as suppression, so alerting,
+    # the digest, the fleet list and MCP score reliability on the same
+    # severity the dashboard shows -- one verdict per host. Order: suppression
+    # first, classification second; the two stamp disjoint fields.
+    classification_store = EventClassificationStore(db_path)
+    event_categories.bind_store(classification_store)
+    store.annotators = [suppression.mark, event_categories.mark]
     # Auto-ticket rules (see ticket_rules.py): which alerts open a ticket is operator
     # policy, not a hardcoded predicate. Same shape as the suppression rules
     # above -- an operator-authored table + an in-memory mirror consulted
@@ -332,6 +341,10 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         policy_engine=policy_engine,
         policy_store=policy_store,
         webfilter=webfilter,
+        # Classify newly seen reliability patterns in the background right
+        # after each push lands, so the alert loop never scores an
+        # unclassified snapshot for want of a dashboard read (ADR-0058).
+        after_insert=partial(event_categories.schedule_classification, client_factory=client_factory),
     )
     call_log = CallLog(event_store=event_store)
     screenshots = ScreenshotStore()
@@ -555,6 +568,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         call_log=call_log,
         webfilter=webfilter,
         suppression=suppression,
+        alert_state=alert_state,
         ticket_rules=ticket_rules,
     )
     # mcp_app owns "/mcp" internally and is mounted at the app root below (not
@@ -587,6 +601,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         await policy_store.connect()
         await webfilter_store.connect()
         await suppression_store.connect()
+        await classification_store.connect()
         await ticket_rule_store.connect()
         await chat_history_store.connect()
         await alert_state.connect()
@@ -618,6 +633,18 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         # Load persisted reliability suppression rules into their mirror too
         # (ADR-0041 / issue #166) -- before any health evaluation can run.
         await suppression.load()
+        # Load persisted event classifications into their mirror (ADR-0058),
+        # then kick a background batch for whatever the latest snapshots
+        # carry that is still unclassified -- so the first alert-loop pass
+        # after an upgrade scores on severity, not on the next push.
+        await event_categories.load_persisted()
+        for _agent_id in await store.known_agents():
+            _latest = await store.latest(_agent_id)
+            if _latest is not None:
+                with contextlib.suppress(Exception):
+                    event_categories.schedule_classification(
+                        _agent_id, _latest["snapshot"], client_factory=client_factory
+                    )
         # Load persisted auto-ticket rules before the alert loop
         # below can dispatch a single notification.
         await ticket_rules.load()
@@ -789,6 +816,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
             await policy_store.close()
             await webfilter_store.close()
             await suppression_store.close()
+            await classification_store.close()
             await ticket_rule_store.close()
             await chat_history_store.close()
             await alert_state.close()
@@ -925,6 +953,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
     app.state.webfilter = webfilter
     app.state.suppression_store = suppression_store
     app.state.suppression = suppression
+    app.state.classification_store = classification_store
     app.state.ticket_rule_store = ticket_rule_store
     app.state.ticket_rules = ticket_rules
     app.state.backup_mgr = backup_mgr

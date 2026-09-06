@@ -7,25 +7,24 @@ use crate::protocol::Status;
 use crate::telemetry::Section;
 
 /// Uptime in seconds beyond which we surface a `warn` (nudge a reboot).
-const WARN_AFTER_SECS: u64 = 60 * 60 * 24 * 30;
-
 /// Collect the `uptime` section.
 pub fn collect() -> Section {
-    let uptime_secs = System::uptime();
-    let boot = System::boot_time();
+    section_for(System::uptime(), System::boot_time())
+}
+
+/// Report the uptime; do not grade it. Whether a month without a reboot is a
+/// finding depends on the OS (Windows applies updates on reboot, a Linux
+/// server does not care) and is the server's call
+/// (`health_rules._rule_uptime`), so the status here is always `Ok`.
+fn section_for(uptime_secs: u64, boot_time_unix: u64) -> Section {
     let days = uptime_secs / 86_400;
     let hours = (uptime_secs % 86_400) / 3_600;
-    let status = if uptime_secs >= WARN_AFTER_SECS {
-        Status::Warn
-    } else {
-        Status::Ok
-    };
     Section::with_fields(
-        status,
+        Status::Ok,
         format!("up {days}d {hours}h"),
         json!({
             "uptime_secs": uptime_secs,
-            "boot_time_unix": boot,
+            "boot_time_unix": boot_time_unix,
         }),
     )
 }
@@ -38,5 +37,15 @@ mod tests {
     fn uptime_section_is_valid() {
         let v = collect().into_value();
         assert!(v["uptime_secs"].as_u64().is_some());
+    }
+
+    #[test]
+    fn uptime_never_grades_the_host() {
+        // Report, do not grade (ADR-0058): a month without a reboot is the
+        // server's call (`health_rules._rule_uptime`), OS-dependent.
+        let v = section_for(120 * 86_400 + 3_600, 0).into_value();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["summary"], "up 120d 1h");
+        assert_eq!(v["uptime_secs"], 120 * 86_400 + 3_600);
     }
 }

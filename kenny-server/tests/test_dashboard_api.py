@@ -497,3 +497,65 @@ def test_about_requires_authentication(tmp_path) -> None:
     app = build_app(db_path=str(tmp_path / "about-auth.sqlite"))
     with TestClient(app) as c:
         assert c.get("/api/about").status_code == 401
+
+
+# -- posture (ADR-0058) ------------------------------------------------------
+
+_POSTURE_ONLY_SNAPSHOT = {
+    "disk": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": 40}]},
+    "encryption": {"status": "ok", "summary": "C: not BitLocker-protected",
+                   "volumes": [{"mount": "C:", "protection_status": 0}]},
+    "listening_ports": {"status": "ok", "summary": "", "ports": [
+        {"proto": "tcp", "port": 3389, "address": "0.0.0.0", "pid": 1, "process": "svchost"}]},
+}
+
+
+def test_fleet_summary_and_label_for_a_posture_only_host() -> None:
+    from kenny_server.health_rules import evaluate_snapshot
+
+    health = evaluate_snapshot(_POSTURE_ONLY_SNAPSHOT)
+    assert health["overall"] == "ok"
+    assert _fleet_summary(health, _POSTURE_ONLY_SNAPSHOT) == "no incidents · 2 posture finding(s)"
+    # Posture is not shouted on the card.
+    assert _severity_label(health, _POSTURE_ONLY_SNAPSHOT) == "HEALTHY"
+
+
+def test_fleet_and_agent_endpoints_carry_posture_tier_and_age(tmp_path) -> None:
+    """Joined across the store, the alert loop's state and the read paths: a
+    posture-only host is `ok` with its posture sections listed, and once the
+    alert loop has recorded the section, `/api/agent` shows how long it has
+    stood."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from kenny_server.alerting import AlertEngine
+
+    app = build_app(db_path=str(tmp_path / "posture.sqlite"))
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=timezone.utc)
+    with TestClient(app) as c:
+        h = _bearer(app)
+        c.portal.call(partial(app.state.store.insert, "pc1", (now - timedelta(days=2)).isoformat(),
+                              _POSTURE_ONLY_SNAPSHOT))
+        agent = next(a for a in c.get("/api/fleet", headers=h).json()["agents"] if a["agent_id"] == "pc1")
+        assert agent["overall"] == "ok"
+        assert agent["flagged_sections"] == []
+        assert agent["posture_sections"] == ["encryption", "listening_ports"]
+        assert agent["severity_label"] == "HEALTHY"
+        assert agent["summary"] == "no incidents · 2 posture finding(s)"
+
+        sections = c.get("/api/agent/pc1", headers=h).json()["health"]["sections"]
+        assert sections["encryption"]["tier"] == "posture"
+        assert sections["encryption"]["attention"] is False
+        assert sections["encryption"]["since"] is None  # the loop has not seen it yet
+        assert sections["disk"]["tier"] == "none"
+
+        class _Registry:
+            def get(self, agent_id):
+                return None
+
+        engine = AlertEngine(store=app.state.store, alert_state=app.state.alert_state,
+                             event_store=app.state.event_store, registry=_Registry(), notifiers=[])
+        assert c.portal.call(partial(engine.evaluate_once, now - timedelta(days=1))) == []
+        sections = c.get("/api/agent/pc1", headers=h).json()["health"]["sections"]
+        assert sections["encryption"]["since"] == (now - timedelta(days=1)).isoformat()
+        assert sections["encryption"]["age_seconds"] >= 86_400

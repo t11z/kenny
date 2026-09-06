@@ -1,4 +1,4 @@
-import type { ReliabilityEvent } from '../types'
+import type { ReliabilityDetails, ReliabilityEvent, ReliabilityPattern } from '../types'
 
 /**
  * The severity the LLM categoriser assigned a group (`docs/protocol.md`,
@@ -37,7 +37,10 @@ export function severityOf(event: ReliabilityEvent): EventSeverity {
  * makes the two impossible to read together. Severity is carried on the badge,
  * where it does not have to compete with volume for the same axis.
  */
-export function groupByCategory(events: ReliabilityEvent[]): EventGroup[] {
+export function groupByCategory(
+  events: ReliabilityEvent[],
+  patterns: Map<string, ReliabilityPattern> = new Map(),
+): EventGroup[] {
   const byCategory = new Map<string, ReliabilityEvent[]>()
   for (const ev of events) {
     const key = ev.category?.trim() || UNCATEGORISED
@@ -45,10 +48,14 @@ export function groupByCategory(events: ReliabilityEvent[]): EventGroup[] {
     if (bucket) bucket.push(ev)
     else byCategory.set(key, [ev])
   }
+  // Within a group, what is still happening outranks what merely happened
+  // often: an active pattern sits above a louder one that went quiet a week
+  // ago. Between groups the ordering stays by volume (see above).
+  const isActive = (ev: ReliabilityEvent) => patterns.get(patternKey(ev))?.active === true
   return [...byCategory.entries()]
     .map(([category, list]) => ({
       category,
-      events: [...list].sort((a, b) => b.count - a.count),
+      events: [...list].sort((a, b) => Number(isActive(b)) - Number(isActive(a)) || b.count - a.count),
       total: list.reduce((sum, ev) => sum + ev.count, 0),
       worst: list.reduce<EventSeverity>(
         (worst, ev) => (SEVERITY_RANK[severityOf(ev)] > SEVERITY_RANK[worst] ? severityOf(ev) : worst),
@@ -96,4 +103,42 @@ export function buildHeatmap(groups: EventGroup[]): Heatmap {
 /** `2026-06-27` -> `06-27`; the year is constant across a 7-day window and only costs width. */
 export function shortDay(iso: string): string {
   return iso.length === 10 ? iso.slice(5) : iso
+}
+
+/** The `(source, event_id)` identity a pattern record and an event group share. */
+export function patternKey(item: { source: string | null; event_id: number | null }): string {
+  return `${item.source ?? ''}|${item.event_id ?? ''}`
+}
+
+/**
+ * Index the section's `details.patterns` (ADR-0058) by `(source, event_id)` so
+ * an event card can look up its own activity record. Tolerates a section with
+ * no details at all (an older server, or a rule that deferred): every lookup
+ * then misses and the cards simply carry no activity chip.
+ */
+export function patternByKey(details: unknown): Map<string, ReliabilityPattern> {
+  const out = new Map<string, ReliabilityPattern>()
+  const patterns = (details as Partial<ReliabilityDetails> | undefined)?.patterns
+  if (!Array.isArray(patterns)) return out
+  for (const p of patterns) {
+    if (p && typeof p === 'object') out.set(patternKey(p), p)
+  }
+  return out
+}
+
+export type ActivityTone = 'active' | 'quiet'
+
+/**
+ * A caps label for what the server decided about a pattern's activity, and
+ * whether it should read as live or as history. Pure formatting of the three
+ * booleans the rule already computed: the console never re-derives "48 hours"
+ * or "three days" from the histogram itself.
+ */
+export function activityLabel(p: ReliabilityPattern, windowDays: number): { label: string; tone: ActivityTone } {
+  const since = p.last_day ? ` · ${shortDay(p.last_day)}` : ''
+  if (p.active && p.recurring) return { label: `ACTIVE · ${p.active_days}/${windowDays} DAYS`, tone: 'active' }
+  if (p.active) return { label: 'NEW', tone: 'active' }
+  if (p.burst && p.recurring) return { label: `BURST${since}`, tone: 'quiet' }
+  if (!p.recurring) return { label: `ONE-OFF${since}`, tone: 'quiet' }
+  return { label: `QUIET SINCE${since || ' ?'}`, tone: 'quiet' }
 }

@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import type { ReliabilityEvent } from '../types'
-import { UNCATEGORISED, buildHeatmap, groupByCategory, severityOf, shortDay } from './reliability'
+import type { ReliabilityEvent, ReliabilityPattern } from '../types'
+import {
+  UNCATEGORISED,
+  activityLabel,
+  buildHeatmap,
+  groupByCategory,
+  patternByKey,
+  patternKey,
+  severityOf,
+  shortDay,
+} from './reliability'
 
 function event(over: Partial<ReliabilityEvent> = {}): ReliabilityEvent {
   return {
@@ -120,5 +129,98 @@ describe('shortDay', () => {
 
   it('leaves anything that is not an ISO date alone', () => {
     expect(shortDay('yesterday')).toBe('yesterday')
+  })
+})
+
+/**
+ * `details.patterns` is the health rule's own activity record per pattern
+ * (ADR-0058). The console joins it onto the event cards and labels it; every
+ * threshold behind `active` / `recurring` / `burst` stays in `health_rules.py`.
+ */
+function pattern(over: Partial<ReliabilityPattern> = {}): ReliabilityPattern {
+  return {
+    source: 'disk',
+    event_id: 7,
+    level: 'error',
+    count: 1,
+    severity: 'unknown',
+    category: null,
+    cause: null,
+    suppressed: false,
+    active_days: 1,
+    first_day: '2026-06-28',
+    last_day: '2026-06-28',
+    last_seen_age_hours: 1,
+    active: true,
+    recurring: false,
+    burst: false,
+    ...over,
+  }
+}
+
+describe('patternByKey', () => {
+  it('indexes patterns by (source, event_id) so an event can find its own record', () => {
+    const map = patternByKey({ patterns: [pattern({ source: 'disk', event_id: 51 }), pattern({ source: 'App', event_id: 1000 })], window_days: 7 })
+
+    expect(map.get(patternKey(event({ source: 'disk', event_id: 51 })))?.source).toBe('disk')
+    expect(map.get(patternKey(event({ source: 'App', event_id: 1000 })))?.event_id).toBe(1000)
+    expect(map.get(patternKey(event({ source: 'nope', event_id: 1 })))).toBeUndefined()
+  })
+
+  it('tolerates a section without details, or malformed ones', () => {
+    expect(patternByKey(undefined).size).toBe(0)
+    expect(patternByKey({ patterns: 'nope' }).size).toBe(0)
+    expect(patternByKey({ patterns: [null, 3] }).size).toBe(0)
+  })
+})
+
+describe('activityLabel', () => {
+  it('names an active, recurring pattern with its persistence over the window', () => {
+    expect(activityLabel(pattern({ active: true, recurring: true, active_days: 5 }), 7)).toEqual({
+      label: 'ACTIVE · 5/7 DAYS',
+      tone: 'active',
+    })
+  })
+
+  it('calls a pattern seen recently but only once so far new, not active', () => {
+    expect(activityLabel(pattern({ active: true, recurring: false }), 7)).toEqual({ label: 'NEW', tone: 'active' })
+  })
+
+  it('dates a burst and a one-off by the day they happened', () => {
+    expect(activityLabel(pattern({ active: false, recurring: true, burst: true, last_day: '2026-06-21' }), 7)).toEqual({
+      label: 'BURST · 06-21',
+      tone: 'quiet',
+    })
+    expect(activityLabel(pattern({ active: false, recurring: false, last_day: '2026-06-24' }), 7)).toEqual({
+      label: 'ONE-OFF · 06-24',
+      tone: 'quiet',
+    })
+  })
+
+  it('says since when a recurring pattern has been quiet', () => {
+    expect(activityLabel(pattern({ active: false, recurring: true, burst: false, last_day: '2026-06-25' }), 7)).toEqual({
+      label: 'QUIET SINCE · 06-25',
+      tone: 'quiet',
+    })
+  })
+})
+
+describe('groupByCategory with activity', () => {
+  it('sorts the still-happening pattern above a louder one that went quiet', () => {
+    const patterns = patternByKey({
+      patterns: [
+        pattern({ source: 'disk', event_id: 1, active: false }),
+        pattern({ source: 'disk', event_id: 2, active: true }),
+      ],
+      window_days: 7,
+    })
+    const groups = groupByCategory(
+      [event({ event_id: 1, category: 'storage', count: 80 }), event({ event_id: 2, category: 'storage', count: 3 })],
+      patterns,
+    )
+
+    expect(groups[0].events.map((e) => e.event_id)).toEqual([2, 1])
+    // Group ordering is still by volume, and the total is untouched.
+    expect(groups[0].total).toBe(83)
   })
 })
