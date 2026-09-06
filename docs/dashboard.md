@@ -113,7 +113,13 @@ read in a few seconds, not studied.
   "Ranked by consequence. Work top to bottom; the rest of the fleet can wait" is the
   intent — everything else is one click away on [Fleet](#fleet) or [Inbox](#inbox), never
   buried here.
+- **Standing facts** — one muted line, `N posture findings unchanged`, for sections in the
+  `posture` tier across the fleet ([ADR-0058](adr/0058-time-aware-findings-and-incident-posture-split.md)):
+  counted here, never ranked into the items above, detailed on each host page. Within a
+  severity, the items are ordered newest finding first, and each carries how long it has
+  stood (`since 3 d`) once the alert loop has recorded it.
 - **Health donut** — the fleet's status mix as three numbers: healthy, warning, critical.
+  A host whose only findings are posture counts as healthy.
 - **Fleet health · 30 days** — a trend line of the same mix over the last month, with a
   **full fleet →** link into [Fleet](#fleet).
 - **Six KPI numbers** — the fleet vitals worth a glance even when nothing is flagged:
@@ -213,6 +219,15 @@ files. A reboot has been pending for 9 days; expect update failures if it waits 
 longer."* With an Anthropic API key it streams from the model; without one the same panel
 shows a concise deterministic summary of the same signals. See
 [Alerting & forecasts](alerting.md#forecasts).
+
+### Posture
+
+Between the problem cards and the healthy checklist, a compact list of **standing facts**:
+sections in the `posture` tier ([ADR-0058](adr/0058-time-aware-findings-and-incident-posture-split.md))
+— an unencrypted system drive, a remote-access port that is open on purpose, updater
+services idling, a month of Windows uptime. Each row shows the rule's reason and how long
+it has stood (`since 31 d`), opens the same detail modal as a problem card, and never
+counts toward the host's overall status or the fleet's donut.
 
 ### Needs attention
 

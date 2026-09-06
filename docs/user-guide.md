@@ -79,6 +79,7 @@ Each PC is a card with a status dot:
 |-----|--------|---------|
 | 🟢 | `ok` | nothing flagged |
 | 🟡 | `warn` | something needs attention (e.g. disk > 80 %, aging battery) |
+| ▫️ | `posture` | on a section only, never on the card: a standing fact about how the PC is set up (drive not encrypted, remote access open, updater services idle). Listed on the host page with its age; never turns a card amber or red, never sends an alert |
 | 🔴 | `crit` | acute problem (e.g. Defender real-time protection off, disk ≥ 95 %) |
 | ⚪ | `unknown`/offline | no recent telemetry / agent not connected |
 

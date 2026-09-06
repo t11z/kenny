@@ -603,6 +603,12 @@ Each section payload **must** include `status` ∈ {`ok`, `warn`, `crit`} and a 
 **Security & crypto:** `firewall`, `encryption`, `av_thirdparty`, `defender_quarantine`.
 **Update & stability:** `reboot_pending`, `os_support`, `reliability`, `app_updates`.
 **Operations & daily:** `uptime`, `time_sync`, `printers`, `wifi_quality`, `autostart`.
+
+Five of these sections **report without grading**, like `reliability` and the inventory
+sections below: `services`, `encryption`, `printers`, `time_sync` and `uptime` always carry
+`status: "ok"`, and the server's health rules are authoritative for them (ADR-0058). The
+raw fields are unchanged; only the collector's own verdict is gone, so a server-side rule
+can relax a section as well as tighten it.
 **Parental controls:** `web_activity`, `screen_time`.
 **Security inventory:** `installed_software`, `browser_extensions`, `listening_ports`,
 `scheduled_tasks`, `local_accounts`.

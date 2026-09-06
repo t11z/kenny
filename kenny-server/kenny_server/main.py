@@ -568,6 +568,7 @@ def build_app(db_path: str | None = None, *, client_factory: Any = _anthropic_cl
         call_log=call_log,
         webfilter=webfilter,
         suppression=suppression,
+        alert_state=alert_state,
         ticket_rules=ticket_rules,
     )
     # mcp_app owns "/mcp" internally and is mounted at the app root below (not

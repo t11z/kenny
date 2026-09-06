@@ -18,7 +18,12 @@
 /* ── Core primitives ─────────────────────────────────────────────────────── */
 
 /** Rolled-up health, worst-of across sections. `health_rules.worst` owns the ordering. */
-export type Severity = 'ok' | 'warn' | 'crit' | 'unknown'
+/**
+ * `posture` is a server-only tier (ADR-0058): a standing configuration fact
+ * that is listed and aged but never alarms and never rolls up into a host's
+ * `overall`. It arrives only on sections, never as an `overall`.
+ */
+export type Severity = 'ok' | 'posture' | 'warn' | 'crit' | 'unknown'
 
 /** Role hierarchy is superuser > operator > user (`security.py`). */
 export type Role = 'superuser' | 'operator' | 'user'
@@ -197,6 +202,8 @@ export interface FleetAgent {
   summary: string
   /** NEW. `HEALTHY` when nothing is flagged. */
   severity_label: string
+  /** Sections in the posture tier (ADR-0058); absent from an older server. */
+  posture_sections?: string[]
   os: string
   agent_version: string
   collected_at: string | null
@@ -218,8 +225,13 @@ export interface HostSection {
   name: string
   status: Severity
   attention: boolean
+  /** `incident` (warn/crit), `posture`, or `none` — decided next to `status` in `health_rules.py`. */
+  tier?: 'incident' | 'posture' | 'none'
   reason?: string
   summary?: string
+  /** ISO instant the section has carried its current status since (`alert_state`), or null. */
+  since?: string | null
+  age_seconds?: number | null
   /**
    * Structured evidence behind `reason`, when the rule has any -- for
    * `reliability`, the per-pattern activity record (`ReliabilityDetails` in
@@ -241,6 +253,9 @@ export interface TodayItem {
   action: string
   /** A console route, e.g. `#/fleet/oma-pc` or `#/inbox/ticket/ae73db26ad3e4c078c93050f63395873`. */
   target: string
+  /** How long the finding has stood (section items only; null until the alert loop has seen it). */
+  since?: string | null
+  age_seconds?: number | null
 }
 
 export interface DonutSegment {
@@ -289,6 +304,9 @@ export interface TodayResponse {
   generated_at: string
   verdict_sentence: string
   items: TodayItem[]
+  /** Standing facts across the fleet — counted, never ranked into `items` (ADR-0058). */
+  posture_count?: number
+  posture_line?: string | null
   donut: { segments: DonutSegment[] }
   trend_30d: { days: TrendDay[] }
   kpis: Kpi[]

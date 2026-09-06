@@ -97,7 +97,9 @@ async def test_first_seen_crit_fires_once(stores) -> None:
     assert len(sent) == 1
     assert sent[0].kind == "alert"
     assert sent[0].priority == "high"
-    assert "disk: ok -> crit" in sent[0].body
+    # The body is the finding, not the transition (ADR-0058).
+    assert sent[0].body == "[CRIT] disk: C: 96% full (>=95%)"
+    assert sent[0].title == "pc1: disk: C: 96% full (>=95%)"
     assert sent[0].agent_id == "pc1"
 
     # Unchanged crit on the next pass: silent (transitions only, no reminders).
@@ -124,7 +126,7 @@ async def test_recovery_fires_after_notified_alert(stores) -> None:
     sent = await engine.evaluate_once(NOW + timedelta(minutes=11))
     assert len(sent) == 1
     assert sent[0].kind == "recovery"
-    assert "disk: crit -> ok" in sent[0].body
+    assert sent[0].body == "[RESOLVED] disk: C: 50% full"
 
 
 async def test_flap_is_suppressed_by_cooldown(stores) -> None:
@@ -158,7 +160,7 @@ async def test_escalation_to_crit_bypasses_cooldown(stores) -> None:
     sent = await engine.evaluate_once(NOW + timedelta(minutes=11))
     assert len(sent) == 1
     assert sent[0].priority == "high"
-    assert "disk: warn -> crit" in sent[0].body
+    assert sent[0].body == "[CRIT] disk: C: 96% full (>=95%)"
 
 
 async def test_offline_alert_and_recovery(stores) -> None:
@@ -863,3 +865,66 @@ def test_alert_loop_and_dashboard_agree_on_reliability(tmp_path, monkeypatch) ->
             assert row is None or row["status"] == "ok"
     finally:
         event_categories.reset_state()
+
+
+# -- posture never notifies; findings carry an age (ADR-0058) ---------------
+
+
+def _posture_snapshot(protected: bool, disk_pct: float = 50.0) -> dict:
+    snap = snapshot(disk_pct)
+    snap["encryption"] = {
+        "status": "ok", "summary": "",
+        "volumes": [{"mount": "C:", "protection_status": 1 if protected else 0}],
+    }
+    return snap
+
+
+async def test_posture_transitions_never_notify_but_are_aged(stores) -> None:
+    store, _, state = stores
+    notifier = FakeNotifier()
+    engine = make_engine(stores, notifier)
+
+    # ok -> posture: silent, but the state row (and so the finding's age) is written.
+    await insert(store, _posture_snapshot(protected=False), NOW - timedelta(minutes=1))
+    assert await engine.evaluate_once(NOW) == []
+    row = await state.get("pc1", "section:encryption")
+    assert row["status"] == "posture" and row["since"] == NOW.isoformat()
+    assert row["last_notified_at"] is None
+
+    # Unchanged posture on the next pass: nothing, and `since` keeps its date.
+    await insert(store, _posture_snapshot(protected=False), NOW + timedelta(days=3))
+    assert await engine.evaluate_once(NOW + timedelta(days=3, minutes=1)) == []
+    assert (await state.get("pc1", "section:encryption"))["since"] == NOW.isoformat()
+
+    # posture -> ok: silent too (there was no announced episode to resolve).
+    await insert(store, _posture_snapshot(protected=True), NOW + timedelta(days=4))
+    assert await engine.evaluate_once(NOW + timedelta(days=4, minutes=1)) == []
+    assert notifier.sent == []
+
+
+async def test_warn_to_posture_is_a_silent_demotion(stores) -> None:
+    store, _, state = stores
+    notifier = FakeNotifier()
+    engine = make_engine(stores, notifier)
+    # A section the loop had recorded as warn (an older rule) now scores posture.
+    await state.upsert("pc1", "section:encryption", status="warn",
+                       since=(NOW - timedelta(days=2)).isoformat(),
+                       last_notified_at=(NOW - timedelta(days=2)).isoformat())
+    await insert(store, _posture_snapshot(protected=False), NOW - timedelta(minutes=1))
+    assert await engine.evaluate_once(NOW) == []
+    row = await state.get("pc1", "section:encryption")
+    assert row["status"] == "posture"
+    assert row["since"] == NOW.isoformat()
+
+
+async def test_posture_to_incident_escalates_like_ok(stores) -> None:
+    store, _, _ = stores
+    notifier = FakeNotifier()
+    engine = make_engine(stores, notifier)
+    await insert(store, _posture_snapshot(protected=False), NOW - timedelta(minutes=1))
+    assert await engine.evaluate_once(NOW) == []
+    # The disk fills up: that escalation fires regardless of the posture section.
+    await insert(store, _posture_snapshot(protected=False, disk_pct=96.0), NOW + timedelta(minutes=5))
+    sent = await engine.evaluate_once(NOW + timedelta(minutes=6))
+    assert [n.body for n in sent] == ["[CRIT] disk: C: 96% full (>=95%)"]
+    assert sent[0].sections == {"disk": "crit"}

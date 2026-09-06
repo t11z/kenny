@@ -10,11 +10,8 @@
 
 use serde_json::json;
 
-use crate::telemetry::Section;
-// The Windows path routes through `core`/`windows_impl`, which import `Status`
-// themselves; the portable stub and the Linux arm name it at this level.
-#[cfg(not(windows))]
 use crate::protocol::Status;
+use crate::telemetry::Section;
 
 /// Collect the `time_sync` section.
 pub fn collect() -> Section {
@@ -42,10 +39,10 @@ pub fn collect() -> Section {
 /// healthy?" rules under `cargo test` on Linux CI, where `w32tm` does not exist.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod core {
-    use crate::protocol::Status;
-
     /// Clock offset (seconds) above which we treat the skew as a warning.
-    pub const MAX_OFFSET_SECS: f64 = 5.0;
+    /// Above this skew the summary mentions the offset. A note for a reader,
+    /// not a threshold: the server's rule owns the verdict.
+    pub const SKEW_NOTE_SECS: f64 = 5.0;
 
     /// Fields parsed from `w32tm /query /status`.
     #[derive(Debug, Default, Clone, PartialEq)]
@@ -93,42 +90,37 @@ pub mod core {
             .unwrap_or(false)
     }
 
-    /// Classify a successful `w32tm /query /status`: large skew or a non-network
-    /// source is a warning; otherwise the clock is healthy.
-    ///
-    /// Returns `(status, summary, synchronized)`.
-    pub fn classify_query(qs: &QueryStatus) -> (Status, String, bool) {
+    /// Summarize a successful `w32tm /query /status` without grading it: the
+    /// summary names a large skew or a non-network source, and the section
+    /// carries `offset_secs`/`synchronized` for the server's rule
+    /// (`health_rules._rule_time_sync`) to judge. Returns `(summary, synchronized)`.
+    pub fn classify_query(qs: &QueryStatus) -> (String, bool) {
         let synchronized = is_network_synchronized(qs.source.as_deref());
         let big_skew = qs
             .offset_secs
-            .map(|o| o.abs() > MAX_OFFSET_SECS)
+            .map(|o| o.abs() > SKEW_NOTE_SECS)
             .unwrap_or(false);
 
         if big_skew {
             (
-                Status::Warn,
                 format!("clock offset {:.2}s", qs.offset_secs.unwrap_or(0.0)),
                 synchronized,
             )
         } else if !synchronized {
-            (
-                Status::Warn,
-                "clock not network-synchronized".to_string(),
-                synchronized,
-            )
+            ("clock not network-synchronized".to_string(), synchronized)
         } else {
-            (Status::Ok, "clock synchronized".to_string(), synchronized)
+            ("clock synchronized".to_string(), synchronized)
         }
     }
 
-    /// Classify when `w32tm /query /status` could not be reached, using the service's
-    /// running state and start mode (`Win32_Service.State` / `.StartMode`).
-    ///
-    /// A trigger-/manual-/auto-start service that is merely stopped is the normal
-    /// idle state on a family PC and must not warn — the clock is still kept in sync
-    /// on demand. Only a disabled or missing service (or a service that is running
-    /// yet still refuses the query) is a real fault.
-    pub fn classify_service(state: Option<&str>, start_mode: Option<&str>) -> (Status, String) {
+    /// Describe the situation when `w32tm /query /status` could not be reached,
+    /// from the service's running state and start mode (`Win32_Service.State` /
+    /// `.StartMode`). A summary only -- the section reports no reading
+    /// (`synchronized`/`offset_secs` null), so the server's rule defers and
+    /// the status stays `Ok`: a trigger-start service that is merely stopped
+    /// is the normal idle state on a family PC, and an unknown is not a
+    /// finding.
+    pub fn classify_service(state: Option<&str>, start_mode: Option<&str>) -> String {
         let disabled = start_mode
             .map(|m| m.eq_ignore_ascii_case("Disabled"))
             .unwrap_or(false);
@@ -138,13 +130,13 @@ pub mod core {
 
         match (start_mode, disabled, running) {
             // Service not present at all.
-            (None, _, _) => (Status::Warn, "time service not found".to_string()),
+            (None, _, _) => "time service not found".to_string(),
             // Explicitly turned off — the clock will drift.
-            (_, true, _) => (Status::Warn, "time service disabled".to_string()),
-            // Running but the query still failed — a genuine anomaly worth surfacing.
-            (_, _, true) => (Status::Warn, "time service not responding".to_string()),
+            (_, true, _) => "time service disabled".to_string(),
+            // Running but the query still failed — an anomaly worth naming.
+            (_, _, true) => "time service not responding".to_string(),
             // Stopped but eligible to trigger-start: the normal idle state.
-            _ => (Status::Ok, "clock synchronized (service idle)".to_string()),
+            _ => "clock synchronized (service idle)".to_string(),
         }
     }
 }
@@ -188,9 +180,9 @@ mod windows_impl {
             }
         }
 
-        let (status, summary) = core::classify_service(state.as_deref(), start_mode.as_deref());
+        let summary = core::classify_service(state.as_deref(), start_mode.as_deref());
         Section::with_fields(
-            status,
+            Status::Ok,
             summary,
             json!({
                 // Unknown while the service is idle — reported as null, not a false "no".
@@ -210,10 +202,10 @@ mod windows_impl {
     }
 
     /// Build the section from a parsed live `w32tm` status.
-    fn query_section(qs: &core::QueryStatus) -> Section {
-        let (status, summary, synchronized) = core::classify_query(qs);
+    pub(super) fn query_section(qs: &core::QueryStatus) -> Section {
+        let (summary, synchronized) = core::classify_query(qs);
         Section::with_fields(
-            status,
+            Status::Ok,
             summary,
             json!({
                 "synchronized": synchronized,
@@ -290,13 +282,15 @@ mod linux_impl {
         // Source is systemd-timesyncd when NTP handling is enabled; timedatectl
         // does not expose the peer or a phase offset.
         let source = show.ntp.then(|| "systemd-timesyncd".to_string());
-        let (status, summary) = if show.synchronized {
-            (Status::Ok, "clock synchronized".to_string())
+        // Report, do not grade: `synchronized` travels as a field for the
+        // server's rule (`health_rules._rule_time_sync`).
+        let summary = if show.synchronized {
+            "clock synchronized".to_string()
         } else {
-            (Status::Warn, "clock not network-synchronized".to_string())
+            "clock not network-synchronized".to_string()
         };
         Section::with_fields(
-            status,
+            Status::Ok,
             summary,
             json!({
                 "synchronized": show.synchronized,
@@ -363,10 +357,6 @@ mod linux_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `Status` is only re-exported through `super` on the `#[cfg(not(windows))]` path,
-    // but the tests below reference it on every platform — import it here directly.
-    use crate::protocol::Status;
-
     #[test]
     fn time_sync_section_is_valid() {
         assert!(collect().into_value()["status"].is_string());
@@ -385,13 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn synced_source_is_ok() {
+    fn synced_source_is_reported_synchronized() {
         let qs = core::QueryStatus {
             source: Some("time.windows.com,0x8".into()),
             offset_secs: Some(0.01),
         };
-        let (status, _, synced) = core::classify_query(&qs);
-        assert_eq!(status, Status::Ok);
+        let (summary, synced) = core::classify_query(&qs);
+        assert_eq!(summary, "clock synchronized");
         assert!(synced);
     }
 
@@ -404,46 +394,59 @@ mod tests {
     }
 
     #[test]
-    fn large_skew_warns() {
+    fn large_skew_is_reported_in_summary() {
         let qs = core::QueryStatus {
             source: Some("time.windows.com,0x8".into()),
             offset_secs: Some(-42.5),
         };
-        let (status, summary, _) = core::classify_query(&qs);
-        assert_eq!(status, Status::Warn);
+        let (summary, _) = core::classify_query(&qs);
         assert!(summary.contains("42.50"));
     }
 
     #[test]
-    fn trigger_start_idle_service_is_ok() {
-        // The regression: a stopped Manual/Auto (trigger-start) service is normal on a
-        // family PC and must not warn just because `w32tm` could not reach it.
-        let (status, _) = core::classify_service(Some("Stopped"), Some("Manual"));
-        assert_eq!(status, Status::Ok);
-
-        let (status, _) = core::classify_service(Some("Stopped"), Some("Auto"));
-        assert_eq!(status, Status::Ok);
+    fn trigger_start_idle_service_is_described_as_idle() {
+        // A stopped Manual/Auto (trigger-start) service is normal on a family PC:
+        // the summary says so, and the section (no reading) makes the server defer.
+        assert!(core::classify_service(Some("Stopped"), Some("Manual")).contains("idle"));
+        assert!(core::classify_service(Some("Stopped"), Some("Auto")).contains("idle"));
     }
 
     #[test]
-    fn disabled_or_missing_service_warns() {
-        let (status, summary) = core::classify_service(Some("Stopped"), Some("Disabled"));
-        assert_eq!(status, Status::Warn);
-        assert!(summary.contains("disabled"));
-
-        let (status, summary) = core::classify_service(None, None);
-        assert_eq!(status, Status::Warn);
-        assert!(summary.contains("not found"));
+    fn disabled_or_missing_service_is_named() {
+        assert!(core::classify_service(Some("Stopped"), Some("Disabled")).contains("disabled"));
+        assert!(core::classify_service(None, None).contains("not found"));
     }
 
     #[test]
-    fn running_service_that_refuses_query_warns() {
-        // In the collector this arm is now reached only after a retry of `w32tm` has
-        // also failed while the service is confirmed running — a genuine anomaly — so
-        // the warn is meaningful rather than a trigger-start race artifact. In isolation
-        // the classifier still maps "running but unreadable" to a warning.
-        let (status, _) = core::classify_service(Some("Running"), Some("Manual"));
-        assert_eq!(status, Status::Warn);
+    fn running_service_that_refuses_query_is_named() {
+        // Reached only after a retry of `w32tm` has also failed while the service is
+        // confirmed running -- the summary names the anomaly; the verdict is the server's.
+        assert!(core::classify_service(Some("Running"), Some("Manual")).contains("not responding"));
+    }
+
+    #[test]
+    fn time_sync_never_grades_the_host() {
+        // Report, do not grade (ADR-0058): even the worst live reading -- a
+        // large skew from a non-network source -- is `Ok`, with the fields the
+        // server's `health_rules._rule_time_sync` judges from carried intact.
+        // Built from a synthetic status, never from a real `w32tm` probe: that
+        // call trigger-starts the Windows Time service and can block for
+        // minutes on a CI runner.
+        #[cfg(windows)]
+        {
+            let qs = core::QueryStatus {
+                source: Some("Local CMOS Clock".into()),
+                offset_secs: Some(-42.5),
+            };
+            let v = windows_impl::query_section(&qs).into_value();
+            assert_eq!(v["status"], "ok");
+            assert_eq!(v["synchronized"], false);
+            assert_eq!(v["offset_secs"], -42.5);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(collect().into_value()["status"], "ok");
+        }
     }
 
     #[test]
@@ -477,8 +480,8 @@ mod tests {
         let raw = "Source: time.windows.com,0x8\nPhase Offset: 0.0123456s\n";
         let qs = core::parse_query_status(raw);
         assert!(core::has_usable_status(&qs));
-        let (status, _, synced) = core::classify_query(&qs);
-        assert_eq!(status, Status::Ok);
+        let (summary, synced) = core::classify_query(&qs);
+        assert_eq!(summary, "clock synchronized");
         assert!(synced);
     }
 }

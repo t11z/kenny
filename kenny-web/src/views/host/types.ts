@@ -60,8 +60,11 @@ export function normalizeSections(raw: unknown): HostSection[] {
       name,
       status: (s.status as Severity) ?? 'unknown',
       attention: Boolean(s.attention ?? (s.status === 'warn' || s.status === 'crit')),
+      tier: (s.tier as HostSection['tier']) ?? (s.status === 'posture' ? 'posture' : s.status === 'warn' || s.status === 'crit' ? 'incident' : 'none'),
       reason: s.reason as string | undefined,
       summary: s.summary as string | undefined,
+      since: (s.since as string | null | undefined) ?? null,
+      age_seconds: (s.age_seconds as number | null | undefined) ?? null,
       details: s.details as Record<string, unknown> | undefined,
     }))
   }

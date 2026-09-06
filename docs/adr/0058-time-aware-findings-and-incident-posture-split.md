@@ -10,157 +10,118 @@
 
 ## Context and Problem Statement
 
-On the operator's live fleet (three Windows hosts, one Linux host) every Windows host was
-`overall=crit`, driven by the `reliability` section, and none of the drivers was a problem:
+On the operator's live fleet every Windows host was `overall=crit`, driven by the
+`reliability` section, and none of the drivers was a problem: a suppressed firehose still
+in the headline count, an 80-event reboot storm a week earlier, a handful of one-off errors
+from one afternoon, fifty events on a single day eight days ago. The one real incident on
+the fleet — two security updates failing every few hours for three days on a host whose
+disk was nearly full — sat in `win_update` at the same visual weight as an offline printer.
 
-| Host | What drove `crit` | What the data actually said |
-|---|---|---|
-| thomas-pc | 12 patterns, "3528 error/critical events in 7d" | CAPI2/4176 ×3381, already suppressed but still in the headline total; DCOM/10010 ×80 all on one day a week ago (a reboot storm); seven one-offs from that same afternoon; one genuinely active pattern (DeviceAssociationService/3503, five of seven days) |
-| linus-pc | GameDVR/10005 ×2 "+5 more" | crit came from the "≥ 5 distinct non-benign patterns" rule; the real incident — two security updates failing every ~4 h for three days, disk 96 % full — sat in `win_update`/`disk`, visually on par with "1 of 4 printers offline" |
-| maria-pc | Hyper-V VmSwitch/63 ×50 | one day, eight days ago |
+Three defects of the health model produced this, none of them a threshold:
 
-The health model had four structural defects, each verified in code:
-
-1. **Scoring counted volume and diversity, not relevance.** `health_rules.py` escalated to
-   crit on ≥ 5 distinct non-benign patterns (every Windows PC clears that bar weekly) or
-   on a `serious` pattern with ≥ 10 hits; its no-annotation fallback escalated on ≥ 50
-   events. The agent already sent `by_day` and `last_seen` per pattern, and nothing read
-   them: a burst eight days ago weighed the same as a pattern seen an hour ago.
-2. **Two scoring paths disagreed about the same host.** The ADR-0026 LLM severity lived in
-   a per-process cache that only the dashboard's two read paths and the `agent_health`
-   tool warmed; push alerting, the weekly digest, the fleet trend and the chat tool loop
-   read snapshots straight from the store and took the volume fallback. ADR-0041 named this
-   divergence and worked around it for suppression only.
-3. **There was no time dimension anywhere.** `alert_state` already recorded `since` per
-   section, and nothing presented it. A standing fact (BitLocker off, RDP open, updater
-   services idle, 112 days of uptime) was re-presented every day as if it had just
-   happened.
-4. **Five sections were graded by the agent with no server rule** (`services`, `printers`,
-   `encryption`, `time_sync`, `uptime`), so the server could never lower them — the bug
-   class `reliability` itself had already been cured of ("report, do not grade").
+1. **Health was a pure function of the latest snapshot.** Nothing distinguished a pattern
+   seen an hour ago from one that stopped a week ago, although the agent already sent the
+   evidence (`by_day`, `last_seen`), and nothing distinguished an event from a standing
+   configuration fact, so an unencrypted drive or an open RDP port was re-presented every
+   day as if it had just happened.
+2. **Two consumers could reach two verdicts about one host.** The ADR-0026 severity lived
+   in a per-process cache warmed only by dashboard reads; push alerting, the digest, the
+   fleet trend and the chat loop scored the raw payload. ADR-0041 named the divergence and
+   worked around it for suppression alone.
+3. **The judgement was not wholly the server's.** Five sections carried only the agent's
+   own grade, which the server could never lower — the defect ADR-0007 assigns to the
+   server side to avoid, and which `reliability` had already been cured of.
 
 The question: what is a finding, when may it alarm, and where does the judgement live?
 
 ## Considered Options
 
-- **Raise the thresholds, or cap one pattern's contribution.** Rejected: ADR-0041 already
-  rejected this — a count cannot tell "3439 identical harmless lines" from "3439
-  individually relevant errors", and a distinct-pattern count cannot tell a reboot storm
-  from a machine falling apart.
+- **Raise thresholds, or cap one pattern's contribution to a count.** Rejected: ADR-0041
+  already rejected this — a count cannot tell "3439 identical harmless lines" from "3439
+  individually relevant errors", nor a reboot storm from a machine falling apart.
 - **Hand-maintained tables of benign services, updater families, or event patterns.**
   Rejected: ADR-0026 and ADR-0041 both rejected hand tables for an open-ended, per-fleet
-  space; the live fleet's "10 auto services stopped" is entirely trigger-start and updater
-  services whose set differs per machine.
-- **Keep two scoring paths and add per-host suppression until the alert path is quiet.**
+  space; the set of idle auto-start services differs per machine.
+- **Keep two scoring paths and suppress per host until the alert path is quiet.**
   Rejected: that is what produced two verdicts per host, and it makes the operator carry
   the cognitive load first in order to be rid of it.
 - **Tweak the agent's own grading constants.** Rejected: ADR-0007 puts judgement on the
-  server so it can change without redeploying binaries; `reliability.rs` already reports
-  without grading for exactly this reason.
-- **Chosen: a findings model.** A finding is either an *incident* (time-bound — new,
-  recurring, escalating — and allowed to alarm) or *posture* (a standing configuration
-  fact — visible, aged, never alarming). Reliability is scored on activity and persistence
-  derived from the evidence the agent already sends; the LLM verdicts become durable and
-  ride the store's read-path seam so every consumer scores the same severity; the five
-  agent-graded sections get server rules and the agent stops grading them; and
-  presentation shows findings with an age instead of section names with a static verb.
+  server so it can change without redeploying binaries.
+- **Chosen: a findings model** — time-aware scoring, an incident/posture split, one
+  scoring path fed by durable verdicts, the server as the only judge.
 
 ## Decision Outcome
 
-Chosen option: the findings model, delivered in two steps.
+Chosen option: the findings model, in three boundary moves.
 
-**Step 1 — reliability scored on activity and persistence; one scoring path.**
+1. **A finding is scored on whether it is still happening, relative to the instant of
+   evaluation.** The reliability rule derives each pattern's activity and persistence from
+   the evidence the agent already sends and scores on that plus the ADR-0026 severity; raw
+   volume and pattern diversity no longer escalate anything, and an unclassified pattern can
+   never be critical on its own. Because health now depends on *when* it is evaluated,
+   historical points are evaluated as of their own `collected_at`, and a finding carries
+   the age of its current status, read from the alert loop's state. The concrete
+   derivation, the constants and the reason format live in `health_rules.py` and are
+   documented in `docs/telemetry.md`; ADR-0041's suppression semantics are unchanged.
 
-- `health_rules.reliability_patterns` derives, per `(source, event_id)` group and relative
-  to the evaluation instant, `active` (last seen within 48 h, or on ≥ 3 distinct days of
-  the window while its last hit is still inside it), `recurring` (≥ 2 distinct days) and
-  `burst` (one day holds ≥ 80 % of the count and the pattern has gone quiet). The verdict:
-  an active `serious` pattern, or a stability index < 3, is **crit**; a `serious` pattern
-  that has gone quiet (it self-clears when it leaves the window), an active *and* recurring
-  `notable`/`unknown` pattern, or a stability index < 6, is **warn**; everything else —
-  benign, one-off, burst, historical, suppressed — is **ok**. There is no count threshold.
-  Without any classification every pattern is `unknown`, which can reach warn but never
-  crit: a count alone is never a critical finding. ADR-0041's semantics are unchanged: a
-  suppressed pattern never scores, and the stability-index overlay is never suppressible.
-- The reason is finding-shaped — up to three scoring patterns with count, days active of
-  the window, age of the last hit and suspected cause, then the historical remainder folded
-  into one clause — and never leads with the raw 7-day total. A rule may now return a third
-  element, `details`, which `evaluate_section` copies into the section verbatim; reliability
-  returns its per-pattern activity there so no client re-derives a threshold.
-- LLM verdicts are persisted in `event_classifications` (`source`, `event_id`, `category`,
-  `severity`, `cause`, `model`, `classified_at`), keyed exactly as the in-memory cache and
-  not per host — a classification is a fact about the pattern. `event_categories.mark`
-  stamps them synchronously from the mirror, and `TelemetryStore.annotators` (the ADR-0041
-  hook, now a list) runs suppression then classification on every read, so alerting, the
-  digest, the fleet list, MCP and the dashboard all read the same severity. Cache misses are
-  filled by a fire-and-forget batch the tunnel kicks right after a push is stored
-  (`AgentTunnel.after_insert`); ingestion never waits for the model, preserving ADR-0026's
-  "ingest independent of AI". A classifier model change drops the old rows at boot.
-- History is evaluated "as of" each snapshot's own `collected_at` (`build_health(now=...)`):
-  with age-based scoring, judging last month's snapshot by today's date would make every
-  historical point look inactive.
+2. **Findings are either incidents or posture.** A fourth server-side status, `posture`,
+   marks a standing configuration fact: visible and aged on the host page, listed once in
+   the weekly digest, never rolled up into a host's overall status, never pushed as an
+   alert, never counted as `attention`. It is a server verdict only — the wire
+   `Section.status` stays `ok|warn|crit`. Every section verdict carries a `tier`, so no
+   consumer re-derives the split. Which sections are posture is a rule-level choice
+   recorded in `health_rules.py` / `docs/telemetry.md`, not here.
 
-**Step 2 — the incident/posture split across sections, and finding-shaped presentation.**
+3. **LLM verdicts are durable server state on the read-path seam.** Classifications are
+   persisted per `(source, event_id)` — a fact about the pattern, not a host — loaded at
+   boot, and stamped onto every snapshot read through the ADR-0041 store hook, which
+   becomes a list of annotators (suppression, then classification). New patterns are
+   classified in the background right after the push that carries them lands; ingestion
+   never waits for the model (ADR-0026's "ingest independent of AI" holds). This closes
+   the two-verdict divergence by construction: every consumer scores the same annotated
+   snapshot.
 
-- A fourth server-side health status, `posture`, alongside `ok`/`warn`/`crit`. It is a
-  server verdict only: `protocol.Status` stays `ok | warn | crit`, and a status from the
-  wire is coerced as before. `worst()` maps posture to ok, so a host whose only findings
-  are posture is `overall=ok`; `evaluate_section` adds `tier = incident | posture | none`.
-  Posture transitions never notify — `ok↔posture`, `warn→posture`, `crit→posture` update
-  alert state silently, so posture findings still carry an age — and posture appears on the
-  host page, as a count line on Today, and once in the weekly digest.
-- Server rules for the agent-graded sections: auto-start services not running (Windows) and
-  an unencrypted system drive are posture; a remote-access port listening is posture (it was
-  warn); an offline printer is ok with a reason; a failed systemd unit, an unsynchronized
-  clock or a large offset are warn, an unreadable time service is posture; ≥ 30 days of
-  Windows uptime is posture, Linux uptime is never a finding. `win_update` is scored on
-  recurrence — an update failing ≥ 3 times across ≥ 2 days is an incident (crit), a single
-  failure a warn — never on a localized title. The five agent collectors stop grading
-  ("report, do not grade", with a test pinning it, as `reliability.rs` has).
-- Age comes from `alert_state.since` (meaning: since the *current* status), stamped at read
-  time by the callers that already touch the store; `health_rules.py` stays pure. Today ranks
-  incidents newest-first and shows their age; alert bodies carry the finding text
-  (`[CRIT] disk: C: 97% full`) instead of `disk: ok -> crit`.
+As a consequence of (3) applied to (1) and (2), the five sections the agent still graded
+(`services`, `encryption`, `printers`, `time_sync`, `uptime`) report without grading, as
+`reliability` already did — an application of ADR-0007, not a new decision.
 
 ### Consequences
 
-- Good, because the live fleet's headline changes from "three machines critical" to the
-  one thing that is: security updates failing for days on one host. A reboot storm, a
-  one-off crash and a pattern that stopped a week ago no longer page anyone, and a pattern
-  firing every day still does.
-- Good, because there is one verdict per host: the alert loop can no longer say crit while
-  the dashboard says ok. The ADR-0041 seam carries both annotations and the joined tests
-  compare the store's read against the dashboard's.
-- Good, because "still happening?" is now a first-class fact (`active`, `recurring`,
-  `burst`, `since`) computed once on the server and only formatted by clients — no
-  threshold is restated in the console or in MCP output.
+- Good, because the live fleet's headline becomes the one incident on it, and a reboot
+  storm, a one-off crash or a pattern that stopped a week ago no longer pages anyone while
+  a pattern firing every day still does.
+- Good, because there is one verdict per host, guaranteed by the seam rather than by
+  every call site remembering to annotate; the joined tests compare the store's read
+  against the dashboard's.
+- Good, because "still happening?" and "how long?" are first-class facts computed once on
+  the server; clients and MCP output only format them.
 - Good, because standing facts stop competing with incidents for attention without being
-  hidden: posture is listed, aged and digested, it just does not paint a host red.
-- Bad / accepted, because a `serious` pattern that stopped three days ago is still a warn
-  until it leaves the window. Chosen deliberately: an unclean shutdown must not vanish
-  silently; it degrades to a dated finding rather than disappearing.
+  hidden.
+- Bad / accepted, because a serious pattern that has gone quiet remains a dated warning
+  until it leaves the collector's window — chosen deliberately, so an unclean shutdown
+  degrades into a dated finding rather than vanishing.
 - Bad / accepted, because event sample messages (already sent to the API under ADR-0026)
-  now also persist server-side in `event_classifications.cause` and via the cached sample
-  the classifier saw; acceptable for a self-hosted deployment, and the table is dropped
-  when the classifier model changes.
-- Bad / accepted, because ages depend on the alert loop running: with
-  `KENNY_ALERT_INTERVAL_SECS=0` nothing writes `alert_state`, so findings carry no `since`.
+  now persist server-side with the verdict; acceptable for a self-hosted deployment, and
+  the rows are dropped when the classifier model changes.
+- Bad / accepted, because ages exist only while the alert loop runs: with
+  `KENNY_ALERT_INTERVAL_SECS=0` nothing writes the state they are read from.
 - Bad / accepted, because a fresh install without an API key scores every reliability
-  pattern as `unknown`: an active, recurring quirk can warn until it is classified or
-  suppressed. It can no longer crit, which is the property that matters.
-- Deliberately not done: diffing `services.status` so that Running→Stopped becomes a change
-  notification. Auto-start updaters flip Running↔Stopped hourly by design; a stopped
-  auto-start service is posture, and a service that *fails* surfaces as Service Control
-  Manager events in `reliability`, scored by activity there.
+  pattern as unclassified: an active, recurring quirk can warn until classified or
+  suppressed. It can no longer be critical, which is the property that matters.
+- Deliberately not done: turning a service's Running→Stopped transition into a change
+  notification. Auto-start updaters flip by design; a stopped auto-start service is
+  posture, and a service that fails surfaces as event-log patterns scored by activity.
 
 ## More Information
 
 - [ADR-0026](0026-llm-categorization-of-reliability-events.md) — amended: the verdict cache
-  is now durable and stamped on every read, not only on the two dashboard read paths.
-- [ADR-0041](0041-reliability-alarm-suppression.md) — amended: the `TelemetryStore.annotate`
-  hook is now a list of annotators; its observation that only the dashboard paths carried
-  severity is what this record closes. Suppression semantics are unchanged.
+  is durable and stamped on every read, not only on the dashboard read paths.
+- [ADR-0041](0041-reliability-alarm-suppression.md) — amended: the `TelemetryStore`
+  annotate hook is a list of annotators; the two-path divergence it observed is closed.
+  Suppression semantics are unchanged.
 - [ADR-0027](0027-push-alerting-ntfy-webhook-and-weekly-digest.md) — the transition-only
-  alert loop this record narrows (posture never notifies) and re-phrases (finding text).
+  alert loop this record narrows: posture never notifies.
 - [ADR-0007](0007-telemetry-push-model-and-sqlite-storage.md) — judgement lives
-  server-side; the five collectors join `reliability` in reporting without grading.
+  server-side; the remaining agent-graded sections now follow it.
+- Thresholds, rule-by-rule verdicts and the reason format: `kenny-server/kenny_server/health_rules.py`,
+  [`docs/telemetry.md`](../telemetry.md), [`docs/alerting.md`](../alerting.md).

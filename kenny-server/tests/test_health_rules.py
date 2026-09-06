@@ -40,13 +40,18 @@ def test_snapshot_overall_is_crit() -> None:
 
 
 def test_attention_flag_matches_status() -> None:
-    """`attention` is computed alongside `status` in evaluate_section itself
-    (kenny-server/CLAUDE.md: thresholds live only here) -- every section in
-    the golden snapshot must carry `attention == (status != "ok")`."""
+    """`attention` and `tier` are computed alongside `status` in
+    evaluate_section itself (kenny-server/CLAUDE.md: thresholds live only
+    here) -- every section in the golden snapshot must carry
+    `attention == (status in {warn, crit})` and a matching tier. A posture
+    section (the fixture's RDP listener) is not attention."""
 
     result = health_rules.evaluate_snapshot(_snapshot(), now=NOW)
     for name, section in result["sections"].items():
-        assert section["attention"] == (section["status"] != "ok"), name
+        assert section["attention"] == (section["status"] in ("warn", "crit")), name
+        assert section["tier"] == health_rules.tier_of(section["status"]), name
+    assert result["sections"]["listening_ports"]["status"] == "posture"
+    assert result["sections"]["listening_ports"]["attention"] is False
 
 
 def test_attention_true_for_warn_and_crit() -> None:
@@ -463,7 +468,9 @@ def test_worst_of() -> None:
     assert health_rules.worst("ok", "ok") == "ok"
 
 
-def test_listening_ports_remote_access_warn() -> None:
+def test_listening_ports_remote_access_is_posture() -> None:
+    # A remote-access listener is how the machine is set up, not something
+    # that happened: listed and aged, never alarmed on (ADR-0058).
     exposed = health_rules.evaluate_section(
         "listening_ports",
         {
@@ -476,7 +483,9 @@ def test_listening_ports_remote_access_warn() -> None:
         },
         now=NOW,
     )
-    assert exposed["status"] == "warn"
+    assert exposed["status"] == "posture"
+    assert exposed["attention"] is False
+    assert exposed["tier"] == "posture"
     assert "3389" in exposed["reason"]
 
     loopback_only = health_rules.evaluate_section(
@@ -658,9 +667,10 @@ def test_portable_sections_apply_for_every_os() -> None:
         "defender": {"status": "ok", "summary": "n/a on this platform"},
     }
     out = health_rules.evaluate_snapshot(snapshot, agent_os="linux", now=NOW)
-    assert out["sections"]["listening_ports"]["status"] == "warn"
+    assert out["sections"]["listening_ports"]["status"] == "posture"
     assert "defender" not in out["sections"]
-    assert out["overall"] == "warn"
+    # Posture never rolls up: a host whose only finding is posture is ok.
+    assert out["overall"] == "ok"
 
 
 def test_net_quality_rules() -> None:
@@ -848,6 +858,158 @@ def test_reliability_existing_tests_unaffected_by_suppression_support() -> None:
     assert "suppressed" not in result["reason"]
 
 
+# -- the posture tier and the sections it covers (ADR-0058) -----------------
+
+
+def test_posture_never_rolls_up_to_overall() -> None:
+    # `max` keeps the first of equally-ranked candidates, so a posture section
+    # listed first would leak into `overall` unless worst() maps it back.
+    assert health_rules.worst("posture") == "ok"
+    assert health_rules.worst("posture", "ok") == "ok"
+    assert health_rules.worst("ok", "posture") == "ok"
+    assert health_rules.worst("posture", "warn") == "warn"
+    assert health_rules.worst("crit", "posture") == "crit"
+    snapshot = {
+        "encryption": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "protection_status": 0}]},
+        "disk": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": 10}]},
+    }
+    out = health_rules.evaluate_snapshot(snapshot, now=NOW)
+    assert out["sections"]["encryption"]["status"] == "posture"
+    assert out["overall"] == "ok"
+
+
+def test_tier_of_and_attention_for_every_status() -> None:
+    assert health_rules.tier_of("crit") == "incident"
+    assert health_rules.tier_of("warn") == "incident"
+    assert health_rules.tier_of("posture") == "posture"
+    assert health_rules.tier_of("ok") == "none"
+    assert health_rules.tier_of("unknown") == "none"
+
+
+def test_services_windows_auto_stopped_is_posture() -> None:
+    # The live thomas-pc list: every "auto service stopped" is a trigger-start
+    # or updater service idling by design. Posture, not a warning.
+    stopped = ["amd3dvcacheSvc", "AsusUpdateCheck", "edgeupdate", "GoogleUpdaterInternalService152",
+               "GoogleUpdaterService152", "gpsvc", "MapsBroker", "PrismaAccessBrowserUpdater",
+               "PrismaAccessBrowserUpdaterInternal", "sppsvc"]
+    services = [{"name": n, "display": n, "start": "Auto", "status": "Stopped"} for n in stopped]
+    services += [{"name": "Dhcp", "display": "DHCP", "start": "Auto", "status": "Running"},
+                 {"name": "BITS", "display": "BITS", "start": "Manual", "status": "Stopped"}]
+    result = health_rules.evaluate_section(
+        "services", {"status": "ok", "summary": "", "services": services}, now=NOW
+    )
+    assert result["status"] == "posture"
+    assert result["reason"].startswith("10 auto-start service(s) not running (e.g. amd3dvcacheSvc, AsusUpdateCheck, edgeupdate, +7 more)")
+    # "Auto (Delayed Start)" counts as auto-start too.
+    delayed = [{"name": "X", "start": "Auto (Delayed Start)", "status": "Stopped"}]
+    assert health_rules.evaluate_section("services", {"status": "ok", "summary": "", "services": delayed}, now=NOW)["status"] == "posture"
+    running = [{"name": "Dhcp", "start": "Auto", "status": "Running"}]
+    assert health_rules.evaluate_section("services", {"status": "ok", "summary": "", "services": running}, now=NOW)["status"] == "ok"
+    # Nothing reported -> the agent's own status stands ("services unavailable").
+    assert "reason" not in health_rules.evaluate_section("services", {"status": "ok", "summary": "", "services": []}, now=NOW)
+
+
+def test_services_linux_failed_unit_is_warn() -> None:
+    failed = [{"name": "nginx.service", "display": "nginx.service", "status": "failed", "start": ""}]
+    result = health_rules.evaluate_section(
+        "services", {"status": "ok", "summary": "", "services": failed}, now=NOW, agent_os="linux"
+    )
+    assert result["status"] == "warn"
+    assert "nginx.service" in result["reason"]
+
+
+def test_encryption_unprotected_system_drive_is_posture_and_skipped_on_linux() -> None:
+    payload = {"status": "ok", "summary": "", "volumes": [
+        {"mount": "D:", "protection_status": 1}, {"mount": "C:\\", "protection_status": 0}]}
+    result = health_rules.evaluate_section("encryption", payload, now=NOW)
+    assert result["status"] == "posture"
+    assert result["reason"] == "C: not BitLocker-protected"
+    encrypted = {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "protection_status": 1}]}
+    assert health_rules.evaluate_section("encryption", encrypted, now=NOW)["status"] == "ok"
+    # "BitLocker state unavailable" carries no volumes -> defer, never "encrypted".
+    assert "reason" not in health_rules.evaluate_section("encryption", {"status": "ok", "summary": "", "volumes": []}, now=NOW)
+    out = health_rules.evaluate_snapshot({"encryption": payload}, agent_os="linux", now=NOW)
+    assert "encryption" not in out["sections"]
+
+
+def test_printers_offline_is_ok_with_reason() -> None:
+    payload = {"status": "ok", "summary": "", "printers": [
+        {"name": "HP OfficeJet", "status": "Offline"}, {"name": "PDF", "status": "Normal"}]}
+    result = health_rules.evaluate_section("printers", payload, now=NOW)
+    assert result["status"] == "ok"
+    assert result["reason"] == "1 of 2 printer(s) offline/error (HP OfficeJet)"
+
+
+def test_time_sync_rules() -> None:
+    def _eval(**fields: object) -> dict:
+        return health_rules.evaluate_section(
+            "time_sync", {"status": "ok", "summary": "", **fields}, now=NOW
+        )
+
+    assert _eval(synchronized=True, source="time.windows.com", offset_secs=0.01)["status"] == "ok"
+    assert _eval(synchronized=False, source="Local CMOS Clock", offset_secs=None)["status"] == "warn"
+    big = _eval(synchronized=True, source="time.windows.com", offset_secs=-42.5)
+    assert big["status"] == "warn" and "42.50" in big["reason"]
+    # No reading at all (service not responding / no time service): not a finding.
+    assert "reason" not in _eval(synchronized=None, source=None, offset_secs=None)
+
+
+def test_uptime_windows_30d_is_posture_linux_is_ok() -> None:
+    month = {"status": "ok", "summary": "", "uptime_secs": 31 * 86_400, "boot_time_unix": 0}
+    win = health_rules.evaluate_section("uptime", month, now=NOW)
+    assert win["status"] == "posture"
+    assert win["reason"].startswith("up 31d")
+    assert health_rules.evaluate_section("uptime", month, now=NOW, agent_os="linux")["status"] == "ok"
+    fresh = {"status": "ok", "summary": "", "uptime_secs": 5 * 86_400}
+    assert health_rules.evaluate_section("uptime", fresh, now=NOW)["status"] == "ok"
+
+
+def _wu(kb: str, at: str, result: str = "failed") -> dict:
+    return {"kb": kb, "title": f"2026-08 Sicherheitsupdate ({kb})", "result": result, "installed_at": at}
+
+
+def test_win_update_repeated_failure_over_days_is_crit() -> None:
+    # The live linus-pc payload: two KBs retried every ~4h for three days.
+    recent = [
+        _wu("KB5121003", "2026-06-04T15:46:00Z"), _wu("KB5120708", "2026-06-04T15:46:00Z"),
+        _wu("KB5121003", "2026-06-04T11:46:00Z"), _wu("KB5120708", "2026-06-04T11:46:00Z"),
+        _wu("KB5121003", "2026-06-03T19:46:00Z"), _wu("KB5120708", "2026-06-03T19:46:00Z"),
+        _wu("KB5121003", "2026-06-02T23:46:00Z"), _wu("KB890830", "2026-06-02T12:00:00Z"),
+        _wu("KB5037853", "2026-05-15T04:00:00Z", "succeeded"),
+    ]
+    result = health_rules.evaluate_section(
+        "win_update", {"status": "ok", "summary": "", "last_check": "2026-06-04T16:00:00Z", "recent": recent}, now=NOW
+    )
+    assert result["status"] == "crit"
+    assert result["reason"] == (
+        "KB5121003 failed 4× since 2026-06-02 (last 3h ago), "
+        "KB5120708 failed 3× since 2026-06-03 (last 3h ago), +1 more"
+    )
+    failed = result["details"]["failed"]
+    assert [f["kb"] for f in failed] == ["KB5121003", "KB5120708", "KB890830"]
+    assert failed[0]["attempts"] == 4 and failed[0]["days"] == 3
+
+
+def test_win_update_single_failure_is_warn_and_stale_check_warns() -> None:
+    once = [_wu("KB5039211", "2026-06-02T04:00:00Z")]
+    result = health_rules.evaluate_section(
+        "win_update", {"status": "ok", "summary": "", "last_check": "2026-06-03T09:00:00Z", "recent": once}, now=NOW
+    )
+    assert result["status"] == "warn"
+    assert result["reason"] == "KB5039211 failed 1× since 2026-06-02 (last 3d ago)"
+    # The same KB failing three times on one day is still a warn: not yet recurrence.
+    same_day = [_wu("KB1", f"2026-06-04T{h:02d}:00:00Z") for h in (1, 5, 9)]
+    assert health_rules.evaluate_section("win_update", {"status": "ok", "summary": "", "recent": same_day}, now=NOW)["status"] == "warn"
+    stale = health_rules.evaluate_section(
+        "win_update", {"status": "ok", "summary": "", "last_check": "2026-05-20T09:00:00Z", "recent": []}, now=NOW
+    )
+    assert stale["status"] == "warn" and stale["reason"] == "no update check for 15d"
+    healthy = health_rules.evaluate_section(
+        "win_update", {"status": "ok", "summary": "", "last_check": "2026-06-03T09:00:00Z", "recent": []}, now=NOW
+    )
+    assert healthy["status"] == "ok" and healthy["details"] == {"failed": []}
+
+
 # -- malformed nested telemetry fields must never raise (fuzzing sweep) ------
 #
 # `Section.model_config` allows arbitrary extra fields (`docs/protocol.md`), so
@@ -879,9 +1041,15 @@ def test_reliability_existing_tests_unaffected_by_suppression_support() -> None:
         ("reliability", {"events": [{"source": 1, "event_id": "x", "count": "3",
                                      "by_day": ["2026-06-04"], "last_seen": 5}]}),
         ("reliability", {"events": [{"by_day": {"not-a-date": 1, "2026-06-04": "2"}}]}),
+        ("services", {"services": ["not-a-dict", {"start": 1, "status": None}]}),
+        ("encryption", {"volumes": ["not-a-dict", {"mount": 3}]}),
+        ("printers", {"printers": [{"status": 12}, "x"]}),
+        ("time_sync", {"synchronized": "yes", "offset_secs": "far"}),
+        ("uptime", {"uptime_secs": "long"}),
+        ("win_update", {"recent": [{"kb": None, "result": "failed", "installed_at": 12}], "last_check": 5}),
     ],
 )
 def test_malformed_nested_field_never_crashes(section: str, payload: dict) -> None:
     full_payload = {"status": "ok", "summary": "x", **payload}
     result = health_rules.evaluate_section(section, full_payload, now=NOW)
-    assert result["status"] in ("ok", "warn", "crit")
+    assert result["status"] in ("ok", "posture", "warn", "crit")

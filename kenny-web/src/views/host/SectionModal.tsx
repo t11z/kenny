@@ -3,6 +3,7 @@ import type { HostSection } from '../../api/types'
 import Modal from '../../components/Modal/Modal'
 import { X, ICON_STROKE_WIDTH } from '../../components/icons'
 import { severityColor } from '../../components/tone'
+import { formatSince } from './format'
 import { sectionIcon, humanizeSectionName, isWebFilterSection, isAccountsSection, isReliabilitySection, isDiskSection } from './sections'
 import { askKenny } from './askKenny'
 import { useWebfilter } from './api'
@@ -87,6 +88,7 @@ export default function SectionModal({ agentId, section, snapshot, aiEnabled, on
         </span>
         <span className={styles.rule} style={{ color }}>
           {section.reason ? `${section.reason} ⇒ ${section.status}` : section.status.toUpperCase()}
+          {formatSince(section.age_seconds) && ` · ${formatSince(section.age_seconds)}`}
         </span>
         <button type="button" className={styles.close} onClick={onClose}>
           <X width={16} height={16} strokeWidth={ICON_STROKE_WIDTH} aria-hidden="true" />
