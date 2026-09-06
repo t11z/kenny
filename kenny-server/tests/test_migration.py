@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from functools import partial
 from datetime import datetime, timedelta, timezone
 
 from starlette.testclient import TestClient
@@ -67,6 +68,8 @@ def test_upgrade_preserves_hosts_and_shared_token(tmp_path, monkeypatch) -> None
     assert {"users", "user_tokens", "sessions", "user_hosts"} <= tables
     # The reliability alarm suppression table (ADR-0041 / issue #166) too.
     assert "reliability_suppressions" in tables
+    # And the persisted event classifications (ADR-0058).
+    assert "event_classifications" in tables
 
 
 def test_suppression_table_created_idempotently_and_survives_a_second_boot(tmp_path) -> None:
@@ -89,6 +92,34 @@ def test_suppression_table_created_idempotently_and_survives_a_second_boot(tmp_p
         assert len(rules) == 1
         assert rules[0]["event_id"] == 4176
         assert app2.state.suppression.match("ANY-PC", "Microsoft-Windows-CAPI2", 4176) is not None
+
+
+def test_event_classifications_table_created_and_survives_a_second_boot(tmp_path) -> None:
+    """The persisted LLM verdicts (ADR-0058) outlive the process: a row
+    written through in boot #1 is in the classifier's cache after boot #2,
+    with no client involved."""
+
+    from kenny_server import event_categories
+
+    db_path = str(tmp_path / "classified.sqlite")
+    app1 = build_app(db_path=db_path)
+    with TestClient(app1) as c:
+        c.portal.call(partial(app1.state.classification_store.upsert_many, [{
+            "source": "disk", "event_id": 51, "category": "Disk & storage",
+            "severity": "serious", "cause": "bad sectors", "model": event_categories.CATEGORIZE_MODEL,
+        }]))
+    event_categories.reset_state()
+
+    app2 = build_app(db_path=db_path)
+    with TestClient(app2) as c:
+        assert event_categories._cache[("disk", 51)] == {
+            "category": "Disk & storage", "severity": "serious", "cause": "bad sectors",
+        }
+        rows = c.portal.call(app2.state.classification_store.list)
+        assert [(r["source"], r["event_id"], r["model"]) for r in rows] == [
+            ("disk", 51, event_categories.CATEGORIZE_MODEL)
+        ]
+    event_categories.reset_state()
 
 
 def test_setup_closes_after_first_account(tmp_path) -> None:

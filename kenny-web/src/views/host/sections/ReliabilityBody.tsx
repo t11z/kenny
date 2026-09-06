@@ -1,13 +1,24 @@
 import { useMemo, useState, type FormEvent } from 'react'
-import type { ReliabilityEvent, ReliabilitySection } from '../types'
+import type { ReliabilityEvent, ReliabilityPattern, ReliabilitySection } from '../types'
 import { formatRelativeTime } from '../format'
 import { useAddSuppression, useRemoveSuppression, useSuppressions } from '../api'
-import { buildHeatmap, groupByCategory, severityOf, shortDay, type EventSeverity } from './reliability'
+import {
+  activityLabel,
+  buildHeatmap,
+  groupByCategory,
+  patternByKey,
+  patternKey,
+  severityOf,
+  shortDay,
+  type EventSeverity,
+} from './reliability'
 import styles from './ReliabilityBody.module.css'
 
 export interface ReliabilityBodyProps {
   agentId: string
   reliability: ReliabilitySection
+  /** The health rule's structured evidence (`HostSection.details`), when present. */
+  details?: Record<string, unknown>
 }
 
 function levelColor(level: string): string {
@@ -82,11 +93,25 @@ function Heatmap({ groups }: { groups: ReturnType<typeof groupByCategory> }) {
   )
 }
 
-function EventCard({ agentId, event }: { agentId: string; event: ReliabilityEvent }) {
+function EventCard({
+  agentId,
+  event,
+  pattern,
+  windowDays,
+}: {
+  agentId: string
+  event: ReliabilityEvent
+  pattern: ReliabilityPattern | undefined
+  windowDays: number
+}) {
   const addSuppression = useAddSuppression()
   const removeSuppression = useRemoveSuppression()
   const color = levelColor(event.level)
   const severity = SEVERITY_STYLE[severityOf(event)]
+  // Whether this is still happening is the other half of the verdict: a
+  // `serious` pattern that stopped a week ago and a `notable` one firing every
+  // day are different findings, and the severity chip alone cannot say which.
+  const activity = pattern ? activityLabel(pattern, windowDays) : null
 
   return (
     <div className={styles.eventCard}>
@@ -98,6 +123,11 @@ function EventCard({ agentId, event }: { agentId: string; event: ReliabilityEven
         <span className={styles.severityChip} style={{ color: severity.color, borderColor: severity.color }}>
           {severity.label}
         </span>
+        {activity && (
+          <span className={styles.activityChip} data-tone={activity.tone}>
+            {activity.label}
+          </span>
+        )}
         <span className={styles.spacer} />
         <span className={styles.count}>{event.count}×</span>
       </div>
@@ -156,7 +186,7 @@ function EventCard({ agentId, event }: { agentId: string; event: ReliabilityEven
  * that are all one benign driver reads completely differently grouped and judged
  * than listed flat.
  */
-export default function ReliabilityBody({ agentId, reliability }: ReliabilityBodyProps) {
+export default function ReliabilityBody({ agentId, reliability, details }: ReliabilityBodyProps) {
   const suppressions = useSuppressions()
   const addSuppression = useAddSuppression()
   const removeSuppression = useRemoveSuppression()
@@ -168,7 +198,9 @@ export default function ReliabilityBody({ agentId, reliability }: ReliabilityBod
 
   const relevantRules = (suppressions.data?.rules ?? []).filter((r) => r.agent_id === '' || r.agent_id === agentId)
   const events = reliability.events ?? []
-  const groups = useMemo(() => groupByCategory(events), [events])
+  const patterns = useMemo(() => patternByKey(details), [details])
+  const groups = useMemo(() => groupByCategory(events, patterns), [events, patterns])
+  const windowDays = reliability.window_days ?? 7
   // A push whose probe failed carries no raw fields at all — only `status` and
   // `summary`. Distinguish that from a genuine reading of zero.
   const reading = reliability.recent_crashes !== undefined
@@ -224,7 +256,13 @@ export default function ReliabilityBody({ agentId, reliability }: ReliabilityBod
                   </summary>
                   <div className={styles.events}>
                     {group.events.map((ev) => (
-                      <EventCard key={`${ev.source}-${ev.event_id}`} agentId={agentId} event={ev} />
+                      <EventCard
+                        key={`${ev.source}-${ev.event_id}`}
+                        agentId={agentId}
+                        event={ev}
+                        pattern={patterns.get(patternKey(ev))}
+                        windowDays={windowDays}
+                      />
                     ))}
                   </div>
                 </details>

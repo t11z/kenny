@@ -206,8 +206,27 @@ class TelemetryStore:
         # here, at the store boundary, means every caller gets it for free
         # instead of each of the ~8 call sites opting in individually. Never
         # touches the persisted row. ``None`` (the default) is a no-op, so
-        # every existing caller and test is unaffected.
-        self.annotate: Callable[[str, dict[str, Any]], None] | None = None
+        # every existing caller and test is unaffected. Since ADR-0058 more
+        # than one annotation rides this seam (suppression, then the persisted
+        # LLM classification), so the hook is a list; ``annotate`` remains as a
+        # single-callable view of it for callers that only ever set one.
+        self.annotators: list[Callable[[str, dict[str, Any]], None]] = []
+
+    @property
+    def annotate(self) -> Callable[[str, dict[str, Any]], None] | None:
+        """The composed read-path annotator, or ``None`` when none is set."""
+
+        if not self.annotators:
+            return None
+        return self._apply_annotators
+
+    @annotate.setter
+    def annotate(self, fn: Callable[[str, dict[str, Any]], None] | None) -> None:
+        self.annotators = [fn] if fn is not None else []
+
+    def _apply_annotators(self, agent_id: str, snapshot: dict[str, Any]) -> None:
+        for fn in self.annotators:
+            fn(agent_id, snapshot)
 
     async def connect(self) -> None:
         if self._db is not None:
@@ -933,6 +952,108 @@ class ReliabilitySuppressionStore:
             "DELETE FROM reliability_suppressions WHERE agent_id = ?", (agent_id,)
         )
         await self._conn.commit()
+        return cur.rowcount or 0
+
+
+_EVENT_CLASSIFICATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS event_classifications (
+    source        TEXT    NOT NULL DEFAULT '',
+    event_id      INTEGER NOT NULL,
+    category      TEXT    NOT NULL,
+    severity      TEXT    NOT NULL,
+    cause         TEXT    NOT NULL DEFAULT '',
+    model         TEXT    NOT NULL DEFAULT '',
+    classified_at TEXT    NOT NULL,
+    PRIMARY KEY (source, event_id)
+);
+"""
+
+
+class EventClassificationStore:
+    """Async SQLite-backed store for the server's LLM verdicts on reliability
+    event patterns (ADR-0026 categorization, made durable by ADR-0058).
+
+    One row per ``(source, event_id)`` pattern -- the same empty-string
+    ``source`` sentinel and int ``event_id`` normalization
+    :mod:`kenny_server.event_categories` keys its cache on. A classification
+    is a fact about the pattern, not about a host, so there is no
+    ``agent_id`` column and removing a host from inventory does not touch
+    this table. ``model`` records which classifier produced the row so a
+    model upgrade can re-classify instead of trusting stale verdicts
+    (:meth:`delete_model_except`).
+    """
+
+    def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
+        self.db_path = db_path
+        self._db: aiosqlite.Connection | None = None
+
+    async def connect(self) -> None:
+        if self._db is not None:
+            return
+        self._db = await aiosqlite.connect(self.db_path)
+        await _configure_connection(self._db)
+        await self._db.executescript(_EVENT_CLASSIFICATION_SCHEMA)
+        await self._db.commit()
+
+    async def close(self) -> None:
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
+
+    @property
+    def _conn(self) -> aiosqlite.Connection:
+        if self._db is None:
+            raise RuntimeError("EventClassificationStore is not connected; call connect() first")
+        return self._db
+
+    async def list(self) -> list[dict[str, Any]]:
+        """Return every persisted classification."""
+
+        async with self._conn.execute(
+            "SELECT source, event_id, category, severity, cause, model, classified_at "
+            "FROM event_classifications ORDER BY source, event_id"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def upsert_many(self, rows: list[dict[str, Any]]) -> None:
+        """Insert or replace classifications. Each row carries ``source``,
+        ``event_id``, ``category``, ``severity``, ``cause`` and ``model``;
+        ``classified_at`` is stamped here."""
+
+        if not rows:
+            return
+        classified_at = datetime.now(timezone.utc).isoformat()
+        async with write_lock():
+            await self._conn.executemany(
+                "INSERT OR REPLACE INTO event_classifications "
+                "(source, event_id, category, severity, cause, model, classified_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(r.get("source") or ""),
+                        int(r["event_id"]),
+                        str(r["category"]),
+                        str(r["severity"]),
+                        str(r.get("cause") or ""),
+                        str(r.get("model") or ""),
+                        classified_at,
+                    )
+                    for r in rows
+                ],
+            )
+            await self._conn.commit()
+
+    async def delete_model_except(self, model: str) -> int:
+        """Drop rows produced by any classifier other than ``model``, so a
+        model upgrade re-classifies rather than serving stale verdicts.
+        Returns the number of rows deleted."""
+
+        async with write_lock():
+            cur = await self._conn.execute(
+                "DELETE FROM event_classifications WHERE model != ?", (model,)
+            )
+            await self._conn.commit()
         return cur.rowcount or 0
 
 

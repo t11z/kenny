@@ -72,7 +72,7 @@ donut (noted in the rule column).
 | `memory` | RAM usage | `percent_used` > 95 → **crit**; > 85 → **warn** |
 | `thermals` | Temperature sensors | hottest sensor ≥ 95 °C → **crit**; ≥ 85 °C → **warn** |
 | `battery` | Battery health and charge (laptops) | `health_percent` < 50 → **crit**; < 70 → **warn**. Laptops only; `battery.present` drives the device (laptop/desktop) pie |
-| `reliability` | Grouped Error/Critical event-log breakdown, stability index | Scored on **pattern severity**, not raw count, once the read-path categorizer has annotated each group: a `serious` pattern recurring ≥ 10×, **or** ≥ 5 distinct non-`benign` patterns, **or** `stability_index` < 3 → **crit**; any non-`benign` (`notable`/`unknown`/`serious`) pattern **or** `stability_index` < 6 → **warn**; all-`benign` → **ok** regardless of count. Reason names the dominant pattern (source/event id, cadence, suspected cause), or says so explicitly when everything is benign. Without annotation (no API key yet, or a raw payload) falls back to `recent_crashes` ≥ 50 **or** `stability_index` < 3 → **crit**; ≥ 15 events, ≥ 8 distinct patterns, any critical-level group, **or** `stability_index` < 6 → **warn**. An operator-suppressed pattern (see *Alarm suppression* below) is excluded from every threshold above — in both the annotated and the fallback path — but never from the `stability_index` overlay |
+| `reliability` | Grouped Error/Critical event-log breakdown, stability index | Scored on whether each pattern is **still happening** and on **what it is** — never on how many lines it produced. From each group's `by_day`/`last_seen` the rule derives *active* (seen within 48 h, or on ≥ 3 days of the window while still inside it), *recurring* (≥ 2 distinct days) and *burst* (one day holds ≥ 80 % of the count and it has gone quiet). Verdict: a `serious` pattern that is active, **or** `stability_index` < 3 → **crit**; a `serious` pattern that has gone quiet (it self-clears when it leaves the window), a `notable`/`unknown` pattern that is active **and** recurring, **or** `stability_index` < 6 → **warn**; everything else — `benign`, one-off, burst, historical — → **ok**. There is no count threshold: without a classification every pattern is `unknown` and can reach warn but never crit. The reason names up to three scoring patterns (source/event id, count, days active of the window, last seen, suspected cause) and folds the rest into `N historical pattern(s) quiet since <date>`; it never leads with the raw 7-day total. Per-pattern activity travels on the section's `details.patterns`. An operator-suppressed pattern (see *Alarm suppression* below) never scores, but never silences the `stability_index` overlay |
 | `web_activity` | Observed domains (parental controls) | a serious flagged hit (`custom` / `seed` / `external_adult`) in 24 h → **crit**; a `bypass` hit in 24 h → **warn** (see [`parental-controls.md`](parental-controls.md)) |
 | `listening_ports` | Listening TCP/UDP ports | a non-loopback listener on **22 / 3389 / 5900 / 5985 / 5986** → **warn** |
 | `local_accounts` | Accounts on the machine (local **and** Microsoft on Windows, `/etc/passwd` on Linux) plus the machine password policy — also the inventory for the `account_*` governance tools, and where each account publishes the verbs it cannot perform | an enabled admin with `password_required` false **and** no password ever set → **crit**; built-in Administrator or Guest enabled → **warn** (Windows only — `root` being enabled on Linux is not a finding); an admin that also carries denied logon rights → **warn** (one of the two settings is stale) (see [`account-governance.md`](account-governance.md)) |
@@ -117,22 +117,31 @@ boot · Windows service · Windows Update · Network · Security · Other.*
 — plus a **severity** (`benign` / `notable` / `serious`, or `unknown` when the model is
 genuinely unsure) and a short plain-language **suspected cause** for the pattern.
 
-The classification is done by the **connected LLM (Haiku)** on the telemetry **read path**,
-validated against fixed enums, and **cached** by `(source, event_id)` — so after warm-up it
-is effectively a no-op. Category/severity/suspected-cause are server-side annotations; the
-agent never sends them. Without an `ANTHROPIC_API_KEY` (or on an API error) every group
-**degrades gracefully to `category="Other"`, `severity="unknown"`** — never to `benign` —
-and the heatmaps, health scoring, and expandable raw groups still work.
+The classification is done by the **connected LLM (Haiku)**, validated against fixed
+enums, and **persisted** by `(source, event_id)` in the `event_classifications` table
+(ADR-0058), mirrored in memory. A pattern is classified once, in the background, right
+after the telemetry push that first carries it lands — ingestion never waits for the
+model — and the persisted verdict is stamped onto every snapshot read from then on, on
+the same read-path seam as alarm suppression below. So push alerting, the weekly digest,
+the fleet list, MCP and the dashboard all score the same severity: one verdict per host.
+Category/severity/suspected-cause are server-side annotations; the agent never sends them.
+Without an `ANTHROPIC_API_KEY` (or on an API error) a pattern stays unclassified and is
+scored as `severity="unknown"` — never as `benign` — and the heatmaps, health scoring, and
+expandable raw groups still work. A classifier model upgrade drops the old verdicts at
+boot and re-classifies.
 
 This drives both the per-host **category × day** heatmap on
 [the host page's Reliability section](dashboard.md#reliability) and the health rule
 itself: a pattern's `severity` is what tells "300 repeats of one known-benign timeout"
-apart from "300 distinct novel errors" (see the `reliability` row in the section table
+apart from "300 distinct novel errors", and its activity — derived from the `by_day`
+histogram and `last_seen` the agent already sends — is what tells a reboot storm a week
+ago apart from a pattern firing every day (see the `reliability` row in the section table
 above). A group with `severity="serious"` also flags its heatmap cell **crit**, even when
 the agent-reported Windows `level` is plain `"error"`.
 
 See [ADR-0026](adr/0026-llm-categorization-of-reliability-events.md) for the categorization
-decision.
+decision and [ADR-0058](adr/0058-time-aware-findings-and-incident-posture-split.md) for
+why the verdicts are persisted and scoring follows activity.
 
 ## Alarm suppression
 
@@ -152,18 +161,17 @@ A suppressed pattern:
 - **carries a distinct `suppressed` badge**, never the `benign` severity pill — "the model
   classified this as harmless" and "the operator decided to ignore this" are different
   claims, from different sources, and the UI keeps them visually separate;
-- is **excluded from severity scoring** — it no longer counts toward the `serious`/
-  `significant` pattern totals (or the raw-volume fallback total when no LLM annotation has
-  run), and drops out of the health rule's reason string, replaced by a
+- is **excluded from severity scoring** — it never counts as a scoring pattern, however
+  active it is, and drops out of the health rule's reason string, replaced by a
   `(N pattern(s) suppressed)` note so the reader knows the quiet is explained, not guessed;
 - **does not affect the `stability_index` overlay** — the Windows Reliability Index is an
   independent, agent-computed signal a suppression rule carries no information about, so it
   keeps applying on top regardless of what's suppressed.
 
-Suppression is a synchronous, LLM-free rule lookup, so — unlike the categorization above —
-it reaches every health consumer, not just the two read paths that run the categorizer:
-push alerting, the weekly digest, the fleet list, and MCP's `agent_health`/`agent_snapshot`
-all see the same `suppressed` marker. Rules are managed via `/api/reliability/suppressions`
+Suppression is a synchronous, LLM-free rule lookup stamped on the telemetry store's
+read path — the same seam the persisted classification above rides — so every health
+consumer sees it: push alerting, the weekly digest, the fleet list, and MCP's
+`agent_health`/`agent_snapshot` all see the same `suppressed` marker. Rules are managed via `/api/reliability/suppressions`
 (operator+ to write) or the `reliability_suppression_list`/`_add`/`_remove` MCP tools. See
 [ADR-0041](adr/0041-reliability-alarm-suppression.md).
 

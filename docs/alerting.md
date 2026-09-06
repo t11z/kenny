@@ -25,12 +25,16 @@ not on every push:
 The persisted flap-suppression state means a server restart never re-fires alerts for
 conditions that were already notified.
 
-!!! note "Reliability alarm suppression also dampens this loop"
-    An operator-suppressed reliability event pattern (ADR-0041, issue #166) is excluded from
-    the `reliability` section's severity scoring wherever that scoring runs — including this
-    push-alert loop and the weekly digest below, not just the dashboard. Muting a known-noisy
-    Windows quirk (e.g. a `CryptSvc` pattern rotating hundreds of times a day) stops it from
-    triggering push notifications too. See [Alarm suppression](telemetry.md#alarm-suppression).
+!!! note "This loop scores reliability exactly like the dashboard"
+    The `reliability` section is scored on whether each event pattern is still happening
+    and on the severity the categorizer assigned it — never on raw volume — and the
+    categorizer's verdicts are persisted and stamped onto every snapshot read (ADR-0058).
+    So the alert loop, the weekly digest below, the fleet list and the dashboard all reach
+    one verdict per host: a reboot storm that wrote 80 identical errors a week ago never
+    pages anyone, and a pattern firing every day does. An operator-suppressed pattern
+    (ADR-0041) is excluded from that scoring everywhere it runs. See the `reliability` row
+    in [telemetry.md](telemetry.md#telemetry-sections) and
+    [Alarm suppression](telemetry.md#alarm-suppression).
 
 !!! note "Offline detection is push-derived"
     An agent counts as **offline** when its newest snapshot is older than the offline

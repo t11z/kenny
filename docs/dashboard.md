@@ -255,8 +255,12 @@ and **disable browser DoH** (`doh_policy`) — plus adding/removing custom domai
 ### Reliability
 
 A custom renderer: a category × day heatmap plus expandable event groups, each row with a
-**severity badge** (`benign`/`notable`/`serious`/`unknown`) and the categorizer's
-plain-language **suspected cause** alongside the raw sample message. Each row has an
+**severity badge** (`benign`/`notable`/`serious`/`unknown`), an **activity chip** saying
+whether the pattern is still happening (`ACTIVE · 5/7 DAYS`, `NEW`, `BURST · 08-30`,
+`ONE-OFF · 09-05`, `QUIET SINCE · 09-01` — the health rule's own reading, see the
+`reliability` row in [telemetry.md](telemetry.md#telemetry-sections)), and the
+categorizer's plain-language **suspected cause** alongside the raw sample message. Within
+a group, patterns that are still happening sort above louder ones that have gone quiet. Each row has an
 icon-only **suppress**/**unsuppress** control, and a suppressed pattern carries a distinct
 **suppressed** badge and a dimmed row — visible but out of the health scoring. Below the
 breakdown, a panel lists and manages suppression rules: a manual form takes an **event id

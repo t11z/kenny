@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -27,7 +27,9 @@ def test_snapshot_section_statuses() -> None:
     assert sections["defender"]["status"] == "crit"
     assert sections["win_update"]["status"] == "warn"
     assert sections["reboot_pending"]["status"] == "warn"
-    # reliability: 48 events (>=15) with no critical group -> warn, content reason.
+    # reliability: two unclassified patterns, each active on 3 of 7 days and
+    # last seen on the fixture's own day -> warn (never crit without a
+    # `serious` verdict), finding-shaped reason.
     assert sections["reliability"]["status"] == "warn"
     assert "×" in sections["reliability"]["reason"]
 
@@ -122,148 +124,273 @@ def test_thermals_no_sensors_defers_to_agent() -> None:
     assert "reason" not in result
 
 
-def test_reliability_content_reason_and_thresholds() -> None:
-    def _eval(payload: dict) -> dict:
-        return health_rules.evaluate_section(
-            "reliability", {"status": "ok", "summary": "", **payload}, now=NOW
-        )
+# -- reliability: activity- and persistence-based scoring (ADR-0058) ---------
+#
+# The rule reads three per-pattern booleans derived from the `by_day` /
+# `last_seen` evidence the agent sends (`active`, `recurring`, `burst`) plus
+# the ADR-0026 severity. There is no count threshold: these tests build
+# payloads that would have tripped the old volume / distinct-pattern rules
+# and assert the verdict now follows what is *still happening*.
 
+
+def _day(offset: int) -> str:
+    """Calendar day ``offset`` days before NOW, as the agent's ``by_day`` key."""
+
+    return (NOW - timedelta(days=offset)).date().isoformat()
+
+
+def _pattern(
+    source: str,
+    event_id: int,
+    *,
+    days: dict[int, int],
+    severity: str | None = None,
+    level: str = "error",
+    last_seen_hours_ago: float | None = None,
+    **extra: object,
+) -> dict:
+    """One reliability event group. ``days`` maps day-offset -> count;
+    ``last_seen`` defaults to the end of the most recent day."""
+
+    by_day = {_day(off): n for off, n in days.items()}
+    e: dict = {
+        "source": source,
+        "event_id": event_id,
+        "level": level,
+        "count": sum(days.values()),
+        "by_day": by_day,
+    }
+    if last_seen_hours_ago is not None:
+        e["last_seen"] = (NOW - timedelta(hours=last_seen_hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if severity is not None:
+        e["severity"] = severity
+    e.update(extra)
+    return e
+
+
+def _eval_reliability(events: list[dict], **fields: object) -> dict:
+    payload = {
+        "status": "ok",
+        "summary": "",
+        "recent_crashes": sum(int(e.get("count", 0)) for e in events),
+        "window_days": 7,
+        "events": events,
+        **fields,
+    }
+    return health_rules.evaluate_section("reliability", payload, now=NOW)
+
+
+def test_reliability_burst_days_ago_scores_ok() -> None:
+    # The thomas-pc reboot storm: 80 DCOM errors on one day a week ago, quiet
+    # since. Under the old rule 80 >= 50 was crit on its own.
     events = [
-        {"source": "Application Error", "event_id": 1000, "level": "error", "count": 30,
-         "category": "App crash / hang"},
-        {"source": "disk", "event_id": 51, "level": "error", "count": 18,
-         "category": "Disk & storage"},
+        _pattern("Microsoft-Windows-DistributedCOM", 10010, days={7: 80}, severity="notable",
+                 last_seen_hours_ago=7 * 24),
     ]
-    warn = _eval({"recent_crashes": 48, "events": events})
-    assert warn["status"] == "warn"
-    # The reason names the biggest categories by count, not a bare number.
-    assert warn["reason"].startswith("App crash / hang ×30")
-    assert "Disk & storage ×18" in warn["reason"]
-
-    # A critical-level group escalates to warn even with a small total.
-    crit_evt = [{"source": "Kernel-Power", "event_id": 41, "level": "critical", "count": 2,
-                 "category": "Power & boot"}]
-    assert _eval({"recent_crashes": 2, "events": crit_evt})["status"] == "warn"
-
-    # Large total -> crit; low stability index -> crit.
-    assert _eval({"recent_crashes": 60, "events": events})["status"] == "crit"
-    assert _eval({"recent_crashes": 3, "stability_index": 2.0})["status"] == "crit"
-
-    # Quiet host -> ok.
-    assert _eval({"recent_crashes": 4, "events": []})["status"] == "ok"
+    result = _eval_reliability(events)
+    assert result["status"] == "ok"
+    assert f"quiet since {_day(7)}" in result["reason"]
+    pattern = result["details"]["patterns"][0]
+    assert pattern["burst"] is True
+    assert pattern["active"] is False
+    assert pattern["recurring"] is False
 
 
-def test_reliability_falls_back_to_source_without_category() -> None:
-    # Before annotation runs (or with no API key), the reason uses the raw source.
-    result = health_rules.evaluate_section(
-        "reliability",
-        {"status": "ok", "summary": "", "recent_crashes": 20,
-         "events": [{"source": "Ntfs", "event_id": 55, "level": "error", "count": 20}]},
-        now=NOW,
-    )
+def test_reliability_one_off_notable_patterns_score_ok() -> None:
+    # Five distinct one-off errors from the same afternoon five days ago --
+    # every Windows PC produces this in a week. The old "≥5 distinct
+    # non-benign patterns -> crit" rule is the thing this test kills.
+    events = [
+        _pattern(f"App{i}", i, days={5: 1}, severity="notable", last_seen_hours_ago=5 * 24)
+        for i in range(5)
+    ]
+    result = _eval_reliability(events)
+    assert result["status"] == "ok"
+    assert "5 historical pattern(s)" in result["reason"]
+
+
+def test_reliability_active_recurring_unknown_scores_warn() -> None:
+    # An unclassifiable pattern (no key, or the model unsure) that keeps
+    # coming back is worth a look -- never silently benign (ADR-0026) ...
+    recurring = [
+        _pattern("Mystery", 1, days={1: 1, 0: 2}, severity="unknown", last_seen_hours_ago=1),
+    ]
+    assert _eval_reliability(recurring)["status"] == "warn"
+    # ... but the same pattern seen on a single day is a one-off, even if it
+    # was seen an hour ago.
+    one_off = [_pattern("Mystery", 1, days={0: 3}, severity="unknown", last_seen_hours_ago=1)]
+    assert _eval_reliability(one_off)["status"] == "ok"
+
+
+def test_reliability_active_serious_scores_crit() -> None:
+    events = [
+        _pattern("disk", 51, days={2: 6, 1: 7, 0: 5}, severity="serious",
+                 last_seen_hours_ago=9, suspected_cause="failing sectors on the boot drive"),
+    ]
+    result = _eval_reliability(events)
+    assert result["status"] == "crit"
+    assert result["reason"].startswith("disk/51 ×18, 3 of 7 days, last seen 9h ago")
+    assert "failing sectors" in result["reason"]
+
+
+def test_reliability_inactive_serious_scores_warn() -> None:
+    # A Kernel-Power/41 three days ago is still a finding (warn), just not an
+    # active one (crit). It self-clears when it leaves the 7-day window.
+    events = [
+        _pattern("Microsoft-Windows-Kernel-Power", 41, days={3: 1}, severity="serious",
+                 last_seen_hours_ago=3 * 24),
+    ]
+    result = _eval_reliability(events)
     assert result["status"] == "warn"
-    assert "Ntfs ×20" in result["reason"]
+    assert "Microsoft-Windows-Kernel-Power/41" in result["reason"]
+    assert "last seen 3d ago" in result["reason"]
+
+
+def test_reliability_windows_critical_level_is_serious_unless_suppressed() -> None:
+    # A Windows-critical entry counts as serious whatever the LLM said ...
+    active_critical = [
+        _pattern("Kernel-Power", 41, days={1: 1, 0: 1}, severity="unknown", level="critical",
+                 last_seen_hours_ago=2),
+    ]
+    assert _eval_reliability(active_critical)["status"] == "crit"
+    # ... unless the operator suppressed that exact pattern (ADR-0041):
+    # explicit intent overrides the automatic escalation.
+    suppressed = [dict(active_critical[0], suppressed=True)]
+    assert _eval_reliability(suppressed)["status"] == "ok"
+
+
+def test_reliability_unannotated_payload_never_crits_on_count_alone() -> None:
+    # No `severity` anywhere (LLM never ran, no key): every pattern is
+    # `unknown`, which can reach warn when active and recurring but never
+    # crit -- a count alone is not a critical finding. 12 patterns × 200
+    # events would have been crit twice over under the old volume rule.
+    events = [
+        _pattern(f"Src{i}", 100 + i, days={2: 50, 1: 50, 0: 100}, last_seen_hours_ago=1)
+        for i in range(12)
+    ]
+    result = _eval_reliability(events)
+    assert result["status"] == "warn"
+    assert result["reason"].startswith("Src0/100 ×200, 3 of 7 days, last seen 1h ago")
+    assert "+9 more active pattern(s)" in result["reason"]
+
+
+def test_reliability_reason_falls_back_to_source_without_category() -> None:
+    # Before annotation runs (or with no API key), the reason names the raw
+    # source/event id and says the cause is unclear rather than inventing one.
+    events = [_pattern("Ntfs", 55, days={2: 5, 1: 5, 0: 10}, last_seen_hours_ago=1)]
+    result = _eval_reliability(events)
+    assert result["status"] == "warn"
+    assert "Ntfs/55 ×20" in result["reason"]
+    assert "cause unclear" in result["reason"]
+
+
+def test_reliability_reason_names_active_patterns_with_cadence_and_age() -> None:
+    # The live thomas-pc shape: one suppressed firehose, one reboot burst, one
+    # genuinely active pattern, a handful of one-offs. The reason must lead
+    # with the finding, not with "3528 error/critical events".
+    events = [
+        _pattern("Microsoft-Windows-CAPI2", 4176, days={i: 480 for i in range(7)},
+                 severity="unknown", last_seen_hours_ago=1, suppressed=True),
+        _pattern("Microsoft-Windows-DistributedCOM", 10010, days={7: 80}, severity="benign",
+                 last_seen_hours_ago=7 * 24),
+        _pattern("Microsoft-Windows-DeviceAssociationService", 3503,
+                 days={7: 19, 6: 1, 2: 2, 1: 29, 0: 1}, severity="notable", last_seen_hours_ago=0.5,
+                 suspected_cause="Device pairing service cannot discover or enumerate endpoints"),
+        _pattern("Universal Print", 1, days={7: 2}, severity="notable", last_seen_hours_ago=7 * 24),
+        _pattern("Volsnap", 25, days={7: 1}, severity="notable", last_seen_hours_ago=7 * 24),
+    ]
+    result = _eval_reliability(events)
+    assert result["status"] == "warn"
+    reason = result["reason"]
+    assert reason.startswith(
+        "Microsoft-Windows-DeviceAssociationService/3503 ×52, 5 of 7 days, last seen <1h ago"
+        " — Device pairing service cannot discover or enumerate endpoints"
+    )
+    assert f"2 historical pattern(s) quiet since {_day(7)}" in reason
+    assert reason.endswith("(1 pattern(s) suppressed)")
+    assert "CAPI2" not in reason
+    assert not reason[0].isdigit()
+
+
+def test_reliability_details_carry_per_pattern_activity() -> None:
+    # Consumers (dashboard chip, `agent_health`) read activity off `details`
+    # instead of re-deriving thresholds -- and the shared `events` list the
+    # heatmap draws from is never mutated.
+    events = [
+        _pattern("disk", 51, days={2: 6, 1: 7, 0: 5}, severity="serious", last_seen_hours_ago=9),
+        _pattern("App", 1000, days={6: 4}, severity="notable", last_seen_hours_ago=6 * 24),
+    ]
+    result = _eval_reliability(events)
+    details = result["details"]
+    assert details["window_days"] == 7
+    by_source = {p["source"]: p for p in details["patterns"]}
+    assert by_source["disk"] == {
+        "source": "disk", "event_id": 51, "level": "error", "count": 18, "severity": "serious",
+        "category": None, "cause": None, "suppressed": False, "active_days": 3,
+        "first_day": _day(2), "last_day": _day(0), "last_seen_age_hours": 9.0,
+        "active": True, "recurring": True, "burst": False,
+    }
+    assert by_source["App"]["active"] is False
+    assert by_source["App"]["burst"] is True
+    assert "active" not in events[0] and "last_seen_age_hours" not in events[0]
+
+
+def test_reliability_activity_is_relative_to_now() -> None:
+    # The same payload judged ten days later -- past its own 7-day window --
+    # is history: this is why history reads must evaluate "as of" the
+    # snapshot's own `collected_at`. (Three active days in the window would
+    # otherwise keep it "active" forever.)
+    events = [
+        _pattern("disk", 51, days={2: 6, 1: 7, 0: 5}, severity="notable", last_seen_hours_ago=9),
+    ]
+    payload = {"status": "ok", "summary": "", "recent_crashes": 18, "window_days": 7, "events": events}
+    assert health_rules.evaluate_section("reliability", payload, now=NOW)["status"] == "warn"
+    later = NOW + timedelta(days=10)
+    assert health_rules.evaluate_section("reliability", payload, now=later)["status"] == "ok"
+
+
+def test_reliability_by_day_stands_in_for_a_missing_last_seen() -> None:
+    # A group without `last_seen` (older agents, hand-built payloads) still
+    # gets an age from the end of its most recent `by_day` day: NOW is 18:30,
+    # so "last seen yesterday" is 18.5h ago.
+    events = [_pattern("disk", 51, days={2: 1, 1: 1}, severity="serious")]
+    result = _eval_reliability(events)
+    assert result["status"] == "crit"
+    assert result["details"]["patterns"][0]["last_seen_age_hours"] == 18.5
 
 
 def test_reliability_benign_repetition_scores_ok() -> None:
-    # Headline case: 300 repeats of ONE known-benign pattern (the
-    # DistributedCOM-timeout symptom from the user story) must not crit a host
-    # on volume alone once the pattern has been annotated as benign.
+    # 300 repeats of ONE known-benign pattern, active every day, must not
+    # warn on volume or persistence: benign is benign (ADR-0026).
     events = [
-        {"source": "DistributedCOM", "event_id": 10016, "level": "error", "count": 304,
-         "category": "Windows service", "severity": "benign",
-         "suspected_cause": "two apps colliding over a stale COM permission"},
+        _pattern("DistributedCOM", 10016, days={i: 43 for i in range(7)}, severity="benign",
+                 last_seen_hours_ago=1, category="Windows service",
+                 suspected_cause="two apps colliding over a stale COM permission"),
     ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 304, "events": events}, now=NOW
-    )
+    result = _eval_reliability(events)
     assert result["status"] == "ok"
     assert "known-benign" in result["reason"]
 
 
-def test_reliability_diverse_significant_patterns_score_crit() -> None:
-    # Many DISTINCT non-benign patterns -> crit, even if no single one repeats
-    # often — novel-error diversity, not volume, is what should escalate here.
+def test_reliability_quiet_host_reasons() -> None:
+    assert _eval_reliability([])["reason"] == "no error patterns in 7d"
+    assert _eval_reliability([])["status"] == "ok"
+    # Historical and benign patterns are both named in the calm reason.
     events = [
-        {"source": f"App{i}", "event_id": i, "level": "error", "count": 2,
-         "category": "App crash / hang", "severity": "notable"}
-        for i in range(5)
+        _pattern("App", 1000, days={6: 4}, severity="notable", last_seen_hours_ago=6 * 24),
+        _pattern("DistributedCOM", 10016, days={0: 3}, severity="benign", last_seen_hours_ago=1),
     ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 10, "events": events}, now=NOW
-    )
-    assert result["status"] == "crit"
-
-
-def test_reliability_recurring_serious_pattern_scores_crit() -> None:
-    # A single 'serious' pattern that recurs meaningfully escalates to crit on
-    # its own, independent of the distinct-pattern count.
-    events = [
-        {"source": "disk", "event_id": 51, "level": "error", "count": 12,
-         "category": "Disk & storage", "severity": "serious",
-         "suspected_cause": "failing sectors on the boot drive"},
-    ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 12, "events": events}, now=NOW
-    )
-    assert result["status"] == "crit"
-    assert "disk/51" in result["reason"]
-    assert "failing sectors" in result["reason"]
-
-
-def test_reliability_unknown_severity_is_treated_as_sensitive() -> None:
-    # An "unknown" severity (no key, or the model genuinely unsure) must never
-    # be silently treated as benign -> at least warn, even at low count.
-    events = [
-        {"source": "Mystery", "event_id": 1, "level": "error", "count": 2,
-         "category": "Other", "severity": "unknown"},
-    ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 2, "events": events}, now=NOW
-    )
-    assert result["status"] == "warn"
+    result = _eval_reliability(events)
+    assert result["status"] == "ok"
+    assert result["reason"] == f"no active error patterns; 1 historical pattern(s) quiet since {_day(6)}, 1 known-benign"
 
 
 def test_reliability_annotated_stability_index_still_applies() -> None:
     # The Windows Reliability Index is an independent signal that still
-    # applies even once events carry severity annotations.
-    result = health_rules.evaluate_section(
-        "reliability",
-        {"status": "ok", "summary": "", "recent_crashes": 0, "events": [], "stability_index": 2.0},
-        now=NOW,
-    )
+    # applies on top of pattern scoring, on a host with no patterns at all.
+    result = _eval_reliability([], stability_index=2.0)
     assert result["status"] == "crit"
-
-
-def test_reliability_falls_back_by_volume_without_severity_annotation() -> None:
-    # DOD/regression guard: unannotated payloads (LLM categorization never ran)
-    # keep the exact original volume-based behavior. This mirrors the
-    # golden fixture, which is a raw (unannotated) agent payload.
-    events = [
-        {"source": "Application Error", "event_id": 1000, "level": "error", "count": 30,
-         "category": "App crash / hang"},
-        {"source": "disk", "event_id": 51, "level": "error", "count": 18,
-         "category": "Disk & storage"},
-    ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 48, "events": events}, now=NOW
-    )
-    assert result["status"] == "warn"
-    assert result["reason"].startswith("App crash / hang ×30")
-
-
-def test_reliability_fallback_distinct_patterns_warn_even_below_volume_threshold() -> None:
-    # No-LLM fallback addition: many distinct low-count
-    # patterns are themselves a signal, even though their sum stays under the
-    # old bare-count warn threshold. Strictly widens sensitivity, never narrows.
-    events = [
-        {"source": f"App{i}", "event_id": i, "level": "error", "count": 1}
-        for i in range(8)
-    ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 8, "events": events}, now=NOW
-    )
-    assert result["status"] == "warn"
+    assert _eval_reliability([], stability_index=5.0)["status"] == "warn"
 
 
 def test_rule_verdict_is_not_floored_by_the_agents_own_status() -> None:
@@ -687,61 +814,36 @@ def test_reliability_suppressed_pattern_not_reported_as_benign() -> None:
     assert "1 pattern(s) suppressed" in result["reason"]
 
 
-def test_reliability_volume_fallback_subtracts_suppressed_from_scoring_total() -> None:
-    # Unannotated events (no `severity` -- the volume fallback path) must also
-    # honour suppression: this is the path that drives push alerting, the
-    # weekly digest, and the fleet list (see reliability_suppression.py).
+def test_reliability_suppression_applies_without_annotation() -> None:
+    # Unannotated events (no `severity` -- the LLM never ran) must also honour
+    # suppression: with the classification persisted (ADR-0058) this is a
+    # rare state, but a fresh install without a key lives in it permanently.
     events = [
-        {"source": "Microsoft-Windows-CAPI2", "event_id": 4176, "level": "error",
-         "count": 3700, "suppressed": True},
-        {"source": "Application Error", "event_id": 1000, "level": "error", "count": 43},
+        _pattern("Microsoft-Windows-CAPI2", 4176, days={i: 480 for i in range(7)},
+                 last_seen_hours_ago=1, suppressed=True),
+        _pattern("Application Error", 1000, days={2: 10, 1: 20, 0: 13}, last_seen_hours_ago=2),
     ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 3743, "events": events},
-        now=NOW,
-    )
-    # scored total = 3743 - 3700 = 43 -> warn (>=15), not crit (<50).
+    result = _eval_reliability(events)
     assert result["status"] == "warn"
     assert "CAPI2" not in result["reason"]
-    assert "Application Error" in result["reason"]
+    assert result["reason"].startswith("Application Error/1000 ×43")
     assert "1 pattern(s) suppressed" in result["reason"]
 
-
-def test_reliability_volume_fallback_ignores_suppressed_critical_and_distinct() -> None:
     # A suppressed critical-level group alone -> ok (not escalated by `level`).
     events = [
-        {"source": "Kernel-Power", "event_id": 41, "level": "critical", "count": 3,
-         "suppressed": True},
+        _pattern("Kernel-Power", 41, days={1: 2, 0: 1}, level="critical", last_seen_hours_ago=1,
+                 suppressed=True),
     ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 3, "events": events},
-        now=NOW,
-    )
-    assert result["status"] == "ok"
-
-    # 8 distinct groups, 7 suppressed -> the distinct-pattern escalation must
-    # not fire on the suppressed ones.
-    events = [
-        {"source": f"App{i}", "event_id": i, "level": "error", "count": 1, "suppressed": True}
-        for i in range(7)
-    ] + [{"source": "App7", "event_id": 7, "level": "error", "count": 1}]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 8, "events": events},
-        now=NOW,
-    )
-    assert result["status"] == "ok"
+    assert _eval_reliability(events)["status"] == "ok"
 
 
 def test_reliability_existing_tests_unaffected_by_suppression_support() -> None:
-    # No `suppressed` key anywhere -> byte-identical to pre-ADR-0041 behavior.
+    # No `suppressed` key anywhere -> the reason carries no suppression clause.
     events = [
-        {"source": "Application Error", "event_id": 1000, "level": "error", "count": 84,
-         "category": "App crash / hang", "severity": "notable"},
+        _pattern("Application Error", 1000, days={2: 30, 1: 30, 0: 24}, severity="notable",
+                 last_seen_hours_ago=1, category="App crash / hang"),
     ]
-    result = health_rules.evaluate_section(
-        "reliability", {"status": "ok", "summary": "", "recent_crashes": 84, "events": events},
-        now=NOW,
-    )
+    result = _eval_reliability(events)
     assert result["status"] == "warn"
     assert "suppressed" not in result["reason"]
 
@@ -773,6 +875,10 @@ def test_reliability_existing_tests_unaffected_by_suppression_support() -> None:
         }),
         ("net_quality", {"reference": "oops", "gateway": "oops"}),
         ("reboot_pending", {"pending": True, "reasons": 123}),
+        ("reliability", {"events": ["not-a-dict"], "recent_crashes": "many"}),
+        ("reliability", {"events": [{"source": 1, "event_id": "x", "count": "3",
+                                     "by_day": ["2026-06-04"], "last_seen": 5}]}),
+        ("reliability", {"events": [{"by_day": {"not-a-date": 1, "2026-06-04": "2"}}]}),
     ],
 )
 def test_malformed_nested_field_never_crashes(section: str, payload: dict) -> None:
