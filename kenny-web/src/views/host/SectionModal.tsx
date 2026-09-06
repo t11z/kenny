@@ -63,7 +63,7 @@ export default function SectionModal({ agentId, section, snapshot, aiEnabled, on
   } else if (isReliabilitySection(section.name)) {
     const reliability = raw as ReliabilitySection | undefined
     body = reliability?.events ? (
-      <ReliabilityBody agentId={agentId} reliability={reliability} />
+      <ReliabilityBody agentId={agentId} reliability={reliability} details={section.details} />
     ) : (
       <p className={styles.fallback}>No reliability data recorded for this host yet.</p>
     )

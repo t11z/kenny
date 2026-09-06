@@ -355,7 +355,9 @@ def build_api_routes(
             points_by_agent[agent_id] = [
                 {
                     "collected_at": d["collected_at"],
-                    "overall": build_health(d["snapshot"], agent_os=agent_os)["overall"],
+                    "overall": build_health(
+                        d["snapshot"], agent_os=agent_os, now=d["collected_at"]
+                    )["overall"],
                 }
                 for d in daily
             ]
@@ -418,7 +420,9 @@ def build_api_routes(
             points_by_agent[agent_id] = [
                 {
                     "collected_at": d["collected_at"],
-                    "overall": build_health(d["snapshot"], agent_os=agent_os)["overall"],
+                    "overall": build_health(
+                        d["snapshot"], agent_os=agent_os, now=d["collected_at"]
+                    )["overall"],
                 }
                 for d in daily
             ]
@@ -567,7 +571,9 @@ def build_api_routes(
         hist_points = [
             {
                 "collected_at": h["collected_at"],
-                "overall": build_health(h["snapshot"], agent_os=agent_os)["overall"],
+                "overall": build_health(
+                    h["snapshot"], agent_os=agent_os, now=h["collected_at"]
+                )["overall"],
             }
             for h in history
         ]

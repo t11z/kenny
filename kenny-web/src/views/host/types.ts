@@ -62,6 +62,7 @@ export function normalizeSections(raw: unknown): HostSection[] {
       attention: Boolean(s.attention ?? (s.status === 'warn' || s.status === 'crit')),
       reason: s.reason as string | undefined,
       summary: s.summary as string | undefined,
+      details: s.details as Record<string, unknown> | undefined,
     }))
   }
   return []
@@ -292,6 +293,39 @@ export interface ReliabilityEvent {
   category?: string
   severity?: 'benign' | 'notable' | 'serious' | 'unknown'
   suspected_cause?: string
+}
+
+/**
+ * One reliability pattern's activity record, as `health_rules.reliability_patterns`
+ * derives it from the group's `by_day`/`last_seen` and the categoriser's verdict
+ * (ADR-0058). Carried on the section's `HostSection.details.patterns`; the three
+ * booleans are the server's, the console only labels them (`activityLabel`).
+ */
+export interface ReliabilityPattern {
+  source: string | null
+  event_id: number | null
+  level: string | null
+  count: number
+  severity: 'benign' | 'notable' | 'serious' | 'unknown'
+  category: string | null
+  cause: string | null
+  suppressed: boolean
+  /** Distinct days in the window with at least one event. */
+  active_days: number
+  first_day: string | null
+  last_day: string | null
+  last_seen_age_hours: number | null
+  /** Still happening: seen within the last two days, or on most days of the window. */
+  active: boolean
+  /** Seen on more than one day -- not a one-off. */
+  recurring: boolean
+  /** One day holds most of the count and it has gone quiet since -- a storm, not a drip. */
+  burst: boolean
+}
+
+export interface ReliabilityDetails {
+  patterns: ReliabilityPattern[]
+  window_days: number
 }
 
 export interface ReliabilitySection extends RawSection {

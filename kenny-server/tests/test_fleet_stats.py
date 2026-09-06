@@ -493,3 +493,33 @@ def test_echarts_asset_served_with_js_mime(tmp_path):
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("application/javascript")
         assert len(r.content) > 0
+
+
+def test_fleet_overview_uses_persisted_classification_without_a_client(tmp_path, monkeypatch):
+    # The heatmap category comes from the persisted verdict (ADR-0058) even
+    # when no client can be built at all -- the read path finds a warm cache.
+    from kenny_server import event_categories
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    def _no_client():
+        raise AssertionError("no client must be constructed")
+
+    app = build_app(db_path=str(tmp_path / "persisted.sqlite"), client_factory=_no_client)
+    snap = {"reliability": {"status": "ok", "summary": "", "recent_crashes": 40, "events": [
+        {"source": "disk", "event_id": 51, "level": "error", "count": 40,
+         "sample": "paging error", "last_seen": "2026-06-07T00:00:00Z"}]}}
+    event_categories.reset_state()
+    try:
+        with TestClient(app) as c:
+            c.portal.call(partial(app.state.classification_store.upsert_many, [{
+                "source": "disk", "event_id": 51, "category": "Disk & storage",
+                "severity": "serious", "cause": "bad sectors", "model": event_categories.CATEGORIZE_MODEL,
+            }]))
+            c.portal.call(event_categories.load_persisted)
+            c.portal.call(partial(app.state.store.insert, "pc1", "2026-06-07T00:00:00Z", snap))
+            rc = c.get("/api/fleet/overview", headers=_bearer(app)).json()["reliability_categories"]
+            assert rc["categories"] == ["Disk & storage"]
+            assert rc["cells"][0]["count"] == 40
+    finally:
+        event_categories.reset_state()

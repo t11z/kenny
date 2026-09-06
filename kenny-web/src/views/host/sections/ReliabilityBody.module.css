@@ -200,6 +200,25 @@
   letter-spacing: var(--track-caps);
 }
 
+/* Whether the pattern is still happening (ADR-0058). Active reads as text,
+   quiet as faint: the severity chip beside it already carries the colour of
+   the judgement, and two coloured chips per row would compete. */
+.activityChip {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 2px;
+  font-family: var(--font-display);
+  font-size: 9px;
+  letter-spacing: var(--track-caps);
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--text-faint) 12%, transparent);
+}
+
+.activityChip[data-tone='active'] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
 /* The grid can outgrow the modal on a long window; it scrolls on its own rather
    than making the whole dialog scroll sideways. */
 .heatmapWrap {

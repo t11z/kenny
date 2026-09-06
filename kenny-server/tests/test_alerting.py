@@ -803,3 +803,63 @@ async def test_the_engine_delivers_on_channels_written_to_settings(stores) -> No
     await insert(store, snapshot(50.0), NOW + timedelta(minutes=1))
     await engine.evaluate_once(NOW + timedelta(minutes=2))
     assert [str(r.url) for r in posted] == ["https://hook.example/live"]
+
+
+# -- one verdict per host (ADR-0058) ----------------------------------------
+
+
+def test_alert_loop_and_dashboard_agree_on_reliability(tmp_path, monkeypatch) -> None:
+    """Joined across the store's annotate seam, the persisted classification
+    and the alert engine: a pattern the classifier persisted as benign is
+    scored benign by the alert loop too -- it never sees the raw payload the
+    old volume fallback would have escalated on -- and the dashboard's
+    ``/api/agent`` read says the same thing.
+    """
+
+    from functools import partial
+
+    from starlette.testclient import TestClient
+
+    from kenny_server import event_categories
+    from kenny_server.main import build_app
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("KENNY_ALERT_INTERVAL_SECS", "0")
+    app = build_app(db_path=str(tmp_path / "agree.sqlite"))
+    now = datetime(2026, 7, 8, 0, 0, tzinfo=timezone.utc)
+    by_day = {f"2026-07-0{d}": 100 for d in range(1, 8)}
+    snap = {"reliability": {"status": "ok", "summary": "700 error/critical events in 7d",
+            "recent_crashes": 700, "window_days": 7, "events": [
+        {"source": "DistributedCOM", "event_id": 10016, "level": "error", "count": 700,
+         "sample": "stale COM permission", "by_day": by_day,
+         "last_seen": "2026-07-07T23:00:00Z"},
+    ]}}
+    event_categories.reset_state()
+    try:
+        with TestClient(app) as c:
+            store = app.state.store
+            c.portal.call(partial(app.state.classification_store.upsert_many, [{
+                "source": "DistributedCOM", "event_id": 10016, "category": "Windows service",
+                "severity": "benign", "cause": "stale COM permission",
+                "model": event_categories.CATEGORIZE_MODEL,
+            }]))
+            c.portal.call(event_categories.load_persisted)
+            c.portal.call(partial(store.insert, "pc1", "2026-07-07T23:30:00Z", snap,
+                                  received_at="2026-07-07T23:30:00Z"))
+
+            h = {"Authorization": f"Bearer {app.state.operator_token}"}
+            section = c.get("/api/agent/pc1", headers=h).json()["health"]["sections"]["reliability"]
+            assert section["status"] == "ok"
+            assert "known-benign" in section["reason"]
+
+            notifier = FakeNotifier()
+            engine = AlertEngine(
+                store=store, alert_state=app.state.alert_state, event_store=app.state.event_store,
+                registry=FakeRegistry({"pc1"}), notifiers=[notifier],
+            )
+            assert c.portal.call(partial(engine.evaluate_once, now)) == []
+            assert notifier.sent == []
+            row = c.portal.call(partial(app.state.alert_state.get, "pc1", "section:reliability"))
+            assert row is None or row["status"] == "ok"
+    finally:
+        event_categories.reset_state()

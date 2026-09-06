@@ -9,6 +9,9 @@ three MCP tools.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+
 import pytest
 from fastmcp import Client, FastMCP
 from starlette.testclient import TestClient
@@ -528,3 +531,64 @@ async def test_agent_snapshot_stamps_suppression(tmp_path) -> None:
     finally:
         await store.close()
         await tel_store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_annotators_compose_suppression_and_classification(tmp_path) -> None:
+    """The joined seam (ADR-0058): with both annotators wired the way
+    ``main.py`` wires them, every snapshot read carries the operator's
+    ``suppressed`` marker *and* the persisted LLM ``severity`` -- so the alert
+    loop, the digest and the fleet list (which read through the store and
+    never call ``annotate_snapshots``) reach the same verdict as the dashboard.
+    """
+
+    from kenny_server import event_categories, health_rules
+
+    store = TelemetryStore(str(tmp_path / "tel3.sqlite"))
+    await store.connect()
+    suppression = SuppressionList(None)
+    suppression.set_rules([{
+        "id": "|Microsoft-Windows-CAPI2|4176", "agent_id": "", "source": "Microsoft-Windows-CAPI2",
+        "event_id": 4176, "note": "", "created_at": "2026-07-01T00:00:00Z", "created_by": "t",
+    }])
+    event_categories.reset_state()
+    event_categories._cache_put(
+        ("Microsoft-Windows-DistributedCOM", 10016),
+        {"category": "Windows service", "severity": "benign", "cause": "stale COM permission"},
+    )
+    try:
+        store.annotators = [suppression.mark, event_categories.mark]
+        by_day = {f"2026-07-0{d}": 100 for d in range(1, 8)}
+        snapshot = {"reliability": {"status": "ok", "summary": "", "recent_crashes": 1400,
+                    "window_days": 7, "events": [
+            {"source": "Microsoft-Windows-CAPI2", "event_id": 4176, "level": "error",
+             "count": 700, "by_day": by_day, "last_seen": "2026-07-07T23:00:00Z"},
+            {"source": "Microsoft-Windows-DistributedCOM", "event_id": 10016, "level": "error",
+             "count": 700, "by_day": by_day, "last_seen": "2026-07-07T23:00:00Z"},
+        ]}}
+        await store.insert("PC-A", "2026-07-07T23:30:00Z", snapshot)
+
+        latest = await store.latest("PC-A")
+        capi2, dcom = latest["snapshot"]["reliability"]["events"]
+        assert capi2["suppressed"] is True and "severity" not in capi2
+        assert dcom["severity"] == "benign" and "suppressed" not in dcom
+
+        # One verdict per host: what the store hands the alert loop scores
+        # exactly like what the dashboard sees after its own annotation pass.
+        now = datetime(2026, 7, 8, 0, 0, tzinfo=timezone.utc)
+        via_store = health_rules.evaluate_snapshot(latest["snapshot"], now=now)
+        dashboard_copy = json.loads(json.dumps(latest["snapshot"]))
+        await event_categories.annotate_snapshots([dashboard_copy], client_factory=lambda: None)
+        via_dashboard = health_rules.evaluate_snapshot(dashboard_copy, now=now)
+        assert via_store["sections"]["reliability"]["status"] == "ok"
+        for key in ("status", "reason", "attention"):
+            assert via_store["sections"]["reliability"][key] == via_dashboard["sections"]["reliability"][key]
+        # Without the classification annotator the same read would have been
+        # judged on `unknown` severity -- active, recurring -> warn.
+        store.annotators = [suppression.mark]
+        unclassified = await store.latest("PC-A")
+        assert health_rules.evaluate_snapshot(unclassified["snapshot"], now=now)["sections"][
+            "reliability"]["status"] == "warn"
+    finally:
+        event_categories.reset_state()
+        await store.close()

@@ -220,6 +220,13 @@ export interface HostSection {
   attention: boolean
   reason?: string
   summary?: string
+  /**
+   * Structured evidence behind `reason`, when the rule has any -- for
+   * `reliability`, the per-pattern activity record (`ReliabilityDetails` in
+   * `views/host/types.ts`). Server-derived in `health_rules.py`; the console
+   * only formats it, so no threshold is ever restated client-side.
+   */
+  details?: Record<string, unknown>
 }
 
 /* ── Today ───────────────────────────────────────────────────────────────── */

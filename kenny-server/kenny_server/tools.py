@@ -251,7 +251,10 @@ class ScreenshotStore:
 
 
 def build_health(
-    snapshot: dict[str, Any] | None, *, agent_os: str = "windows"
+    snapshot: dict[str, Any] | None,
+    *,
+    agent_os: str = "windows",
+    now: datetime | str | None = None,
 ) -> dict[str, Any]:
     """Run health rules over a stored snapshot (or empty when none).
 
@@ -259,11 +262,21 @@ def build_health(
     :func:`health_rules.evaluate_snapshot` so a non-Windows agent's Windows-only
     sections are not scored (ADR-0031). Defaults to ``windows`` for callers that
     have no agent context, preserving prior behavior.
+
+    ``now`` is the instant the rules evaluate "as of". Callers scoring the
+    *latest* snapshot leave it unset (wall clock); callers scoring a
+    **historical** point (the fleet trend, a host's history sparkline) must
+    pass that point's ``collected_at`` -- as a datetime or the stored ISO
+    string -- because age-based rules (reliability activity, Defender's last
+    scan, OS end-of-life) would otherwise judge last month's snapshot by
+    today's date and make every old point look stale.
     """
 
     if not snapshot:
         return {"overall": "unknown", "sections": {}}
-    return health_rules.evaluate_snapshot(snapshot, agent_os=agent_os)
+    if isinstance(now, str):
+        now = health_rules.parse_ts(now)
+    return health_rules.evaluate_snapshot(snapshot, agent_os=agent_os, now=now)
 
 
 async def agent_overview(
