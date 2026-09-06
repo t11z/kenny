@@ -254,10 +254,10 @@ These read server state and are never forwarded. All are read-only.
 
 | Tool | Arguments | Purpose |
 |------|-----------|---------|
-| `list_agents` | — | Known agents with online state and rolled-up health. |
+| `list_agents` | — | Known agents with online state and rolled-up health: `overall`, `flagged_sections` (the incidents — warn/crit) and `posture_sections` (standing facts that never roll up; see the status model in [telemetry.md](telemetry.md#status-model)). |
 | `select_agent` | `id` | Validate an agent id and set the Ask kenny overlay's default (advisory only over MCP — it does not route forwarded calls there; see the note above). |
-| `fleet_overview` | — | Per-agent rolled-up health for the whole fleet. |
-| `agent_health` | `id` | Per-section health status/summary for one agent. |
+| `fleet_overview` | — | Per-agent rolled-up health for the whole fleet, in the same shape as `list_agents`. |
+| `agent_health` | `id` | Per-section health for one agent: `status`, `summary`, `reason`, `attention`, `tier` (`incident` / `posture` / `none`), `since` and `age_seconds` (how long the section has held its current status, from the alert loop's state; null until it has seen it) and, where a rule has structured evidence, `details` (the reliability rule's per-pattern activity record, `win_update`'s per-KB failures). |
 | `agent_snapshot` | `id`, `section?` | Latest stored telemetry snapshot (optionally one section). |
 
 !!! note "`select_agent` is withheld from the Discord ticket surface"

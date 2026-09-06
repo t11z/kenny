@@ -16,15 +16,40 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-Status = str  # "ok" | "warn" | "crit"
+Status = str  # "ok" | "posture" | "warn" | "crit"
 
-_ORDER = {"ok": 0, "warn": 1, "crit": 2}
+# ``posture`` is a server-side verdict only (ADR-0058): a standing configuration
+# fact -- an unencrypted system drive, a remote-access port that is meant to be
+# open, an updater service that is idle by design -- that is worth listing and
+# ageing but is neither new nor time-bound, so it never alarms and never rolls
+# up into a host's overall status. It ranks with ``ok`` here on purpose:
+# :func:`worst` maps it back to ``ok`` so a host whose only findings are
+# posture is a healthy host. The wire ``Section.status`` stays
+# ``ok|warn|crit`` (``protocol.Status``); an agent can never send posture.
+_ORDER = {"ok": 0, "posture": 0, "warn": 1, "crit": 2}
+
+# Which findings alarm: a section in one of these states is an *incident*.
+INCIDENT_STATUSES: frozenset[str] = frozenset({"warn", "crit"})
 
 
 def worst(*statuses: Status) -> Status:
-    """Return the most severe of the given statuses (crit > warn > ok)."""
+    """Return the most severe of the given statuses (crit > warn > ok).
 
-    return max((s for s in statuses if s), key=lambda s: _ORDER.get(s, 0), default="ok")
+    ``posture`` never wins: it shares ``ok``'s rank and, because ``max`` keeps
+    the first of equally-ranked candidates, is mapped to ``ok`` explicitly so a
+    posture section listed first cannot leak into a roll-up.
+    """
+
+    result = max((s for s in statuses if s), key=lambda s: _ORDER.get(s, 0), default="ok")
+    return "ok" if result == "posture" else result
+
+
+def tier_of(status: Status) -> str:
+    """``incident`` (warn/crit), ``posture``, or ``none`` (ok/unknown)."""
+
+    if status in INCIDENT_STATUSES:
+        return "incident"
+    return "posture" if status == "posture" else "none"
 
 
 def _valid_status(value: Any) -> Status:
@@ -139,12 +164,89 @@ def _rule_defender(payload: dict[str, Any], now: datetime) -> "tuple[Status, str
     return "ok", "Defender healthy"
 
 
-def _rule_win_update(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+# An update that keeps failing across days is an incident the machine cannot
+# resolve on its own; a single failed attempt is ordinary Windows Update noise
+# that usually clears on the next retry. Recurrence across days is the signal
+# -- never the localized title (the live fleet's are German), and never the
+# raw row count (the collector caps ``recent`` at 25, so a KB retrying every
+# four hours fills the whole list by itself).
+_WIN_UPDATE_REPEAT_ATTEMPTS_CRIT = 3
+_WIN_UPDATE_REPEAT_DAYS_CRIT = 2
+_WIN_UPDATE_STALE_CHECK_DAYS = 7
+_WIN_UPDATE_NAMED = 2
+
+
+def _rule_win_update(
+    payload: dict[str, Any], now: datetime
+) -> "tuple[Status, str, dict[str, Any]] | None":
     recent = _dicts(payload.get("recent"))
-    failed = [u for u in recent if str(u.get("result", "")).lower() == "failed"]
+    by_kb: dict[str, dict[str, Any]] = {}
+    for u in recent:
+        if str(u.get("result", "")).lower() != "failed":
+            continue
+        key = str(u.get("kb") or u.get("title") or "?")
+        at = _parse_ts(u.get("installed_at"))
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        row = by_kb.setdefault(
+            key,
+            {"kb": key, "title": str(u.get("title") or ""), "attempts": 0, "days": set(),
+             "first_failed": None, "last_failed": None},
+        )
+        row["attempts"] += 1
+        if at is not None:
+            row["days"].add(at.date().isoformat())
+            if row["first_failed"] is None or at < row["first_failed"]:
+                row["first_failed"] = at
+            if row["last_failed"] is None or at > row["last_failed"]:
+                row["last_failed"] = at
+
+    failed = sorted(by_kb.values(), key=lambda r: (-r["attempts"], r["kb"]))
+    details = {
+        "failed": [
+            {
+                "kb": r["kb"],
+                "title": r["title"],
+                "attempts": r["attempts"],
+                "days": len(r["days"]),
+                "first_failed": r["first_failed"].isoformat() if r["first_failed"] else None,
+                "last_failed": r["last_failed"].isoformat() if r["last_failed"] else None,
+            }
+            for r in failed
+        ]
+    }
+    repeating = [
+        r
+        for r in failed
+        if r["attempts"] >= _WIN_UPDATE_REPEAT_ATTEMPTS_CRIT
+        and len(r["days"]) >= _WIN_UPDATE_REPEAT_DAYS_CRIT
+    ]
+
+    last_check = _parse_ts(payload.get("last_check"))
+    if last_check is not None and last_check.tzinfo is None:
+        last_check = last_check.replace(tzinfo=timezone.utc)
+    stale_days = (now - last_check).days if last_check is not None else None
+
+    def _describe(r: dict[str, Any]) -> str:
+        text = f"{r['kb']} failed {r['attempts']}×"
+        if r["first_failed"]:
+            text += f" since {r['first_failed'].date().isoformat()}"
+        if r["last_failed"]:
+            hours = max(0.0, (now - r["last_failed"]).total_seconds() / 3600)
+            text += f" (last {_age_label(hours)} ago)"
+        return text
+
     if failed:
-        return "warn", f"{len(failed)} update(s) failed"
-    return "ok", "Updates healthy"
+        named = (repeating or failed)[:_WIN_UPDATE_NAMED]
+        reason = ", ".join(_describe(r) for r in named)
+        extra = len(failed) - len(named)
+        if extra > 0:
+            reason += f", +{extra} more"
+        status: Status = "crit" if repeating else "warn"
+        return status, reason, details
+    if stale_days is not None and stale_days >= _WIN_UPDATE_STALE_CHECK_DAYS:
+        return "warn", f"no update check for {stale_days}d", details
+    return "ok", "Updates healthy", details
 
 
 def _rule_reboot_pending(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
@@ -527,9 +629,13 @@ def _rule_listening_ports(payload: dict[str, Any], now: datetime) -> "tuple[Stat
         and not str(p.get("address", "")).startswith(("127.", "::1"))
     ]
     if exposed:
+        # A remote-access listener is a standing fact about how the machine is
+        # set up -- RDP on an admin PC, sshd on a server -- not an event. It is
+        # listed and aged as posture; a port that *appears* is caught by the
+        # inventory diff (diffs.py) as a change notification.
         e = exposed[0]
         example = f"{e.get('proto', '?')}/{e.get('port', '?')} {e.get('process', '?')}"
-        return "warn", f"{len(exposed)} remote-access port(s) listening (e.g. {example})"
+        return "posture", f"{len(exposed)} remote-access port(s) listening (e.g. {example})"
     return None
 
 
@@ -653,6 +759,120 @@ def _rule_net_quality(payload: dict[str, Any], now: datetime) -> "tuple[Status, 
     return None
 
 
+# -- sections the agent used to grade itself (ADR-0058) ------------------------
+#
+# ``services``, ``encryption``, ``printers``, ``time_sync`` and ``uptime`` carried
+# only the collector's own verdict, which this module could never lower -- the
+# bug class ``reliability`` was cured of first. Each now has a rule here and
+# the collectors report without grading. Most of what they report is posture:
+# a fact about how the machine is configured that is true today exactly as it
+# was yesterday, and that no operator wants to be told about every day.
+
+_SERVICES_NAMED = 3
+
+
+def _rule_services(
+    payload: dict[str, Any], now: datetime, agent_os: str = "windows"
+) -> "tuple[Status, str] | None":
+    services = _dicts(payload.get("services"))
+    if not services:
+        return None  # nothing reported (probe failed, or no failed units on Linux)
+    if _is_windows(agent_os):
+        # Auto-start services that are not running are, on a real PC, almost
+        # always trigger-start and updater services idling by design (Edge and
+        # Google updaters, sppsvc, gpsvc, MapsBroker ...). That is posture: worth
+        # a list, never an alarm. A service that *fails* announces itself as
+        # Service Control Manager events in `reliability`, scored by activity.
+        stalled = [
+            str(svc.get("name") or svc.get("display") or "?")
+            for svc in services
+            if str(svc.get("start") or "").lower().startswith("auto")
+            and str(svc.get("status") or "").lower() != "running"
+        ]
+        if not stalled:
+            return "ok", f"{len(services)} services, all auto-start running"
+        example = ", ".join(stalled[:_SERVICES_NAMED])
+        extra = len(stalled) - _SERVICES_NAMED
+        suffix = f", +{extra} more" if extra > 0 else ""
+        return "posture", f"{len(stalled)} auto-start service(s) not running (e.g. {example}{suffix})"
+    # Linux reports failed systemd units only; a failed unit is an incident.
+    failed = [
+        str(svc.get("name") or "?")
+        for svc in services
+        if str(svc.get("status") or "").lower() == "failed"
+    ]
+    if failed:
+        example = ", ".join(failed[:_SERVICES_NAMED])
+        return "warn", f"{len(failed)} failed unit(s) (e.g. {example})"
+    return "ok", "all units healthy"
+
+
+def _rule_encryption(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+    volumes = _dicts(payload.get("volumes"))
+    if not volumes:
+        return None  # BitLocker state unavailable -> defer, never "encrypted"
+    system = next(
+        (v for v in volumes if str(v.get("mount") or "").rstrip("\\").upper() == "C:"),
+        volumes[0],
+    )
+    mount = str(system.get("mount") or "C:").rstrip("\\").upper()
+    if system.get("protection_status") == 1:
+        return "ok", "system drive encrypted"
+    return "posture", f"{mount} not BitLocker-protected"
+
+
+def _rule_printers(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+    printers = _dicts(payload.get("printers"))
+    if not printers:
+        return None
+    bad = [
+        str(p.get("name") or "?")
+        for p in printers
+        if any(word in str(p.get("status") or "").lower() for word in ("error", "offline"))
+    ]
+    if not bad:
+        return "ok", f"{len(printers)} printer(s) OK"
+    # An offline printer is neither an incident nor posture: it is a fact
+    # about a peripheral that is switched off, visible in the section, and
+    # not a finding about the machine.
+    return "ok", f"{len(bad)} of {len(printers)} printer(s) offline/error ({', '.join(bad[:2])})"
+
+
+_TIME_SYNC_MAX_OFFSET_SECS = 5.0
+
+
+def _rule_time_sync(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
+    synchronized = payload.get("synchronized")
+    offset = _number(payload.get("offset_secs"))
+    if synchronized is None and offset is None:
+        # No reading (time service not queryable, or a platform without one):
+        # the agent's summary says which, and an unknown is not a finding.
+        return None
+    if offset is not None and abs(offset) > _TIME_SYNC_MAX_OFFSET_SECS:
+        return "warn", f"clock offset {offset:.2f}s"
+    if synchronized is False:
+        return "warn", "clock not network-synchronized"
+    return "ok", "clock synchronized"
+
+
+_UPTIME_POSTURE_SECS = 30 * 24 * 3600
+
+
+def _rule_uptime(
+    payload: dict[str, Any], now: datetime, agent_os: str = "windows"
+) -> "tuple[Status, str] | None":
+    secs = _number(payload.get("uptime_secs"))
+    if secs is None:
+        return None
+    days = int(secs // 86_400)
+    if _is_windows(agent_os) and secs >= _UPTIME_POSTURE_SECS:
+        # Windows applies updates on reboot; a month without one means
+        # patches are waiting. Standing fact, not an event: posture.
+        return "posture", f"up {days}d — Windows updates need a reboot to apply"
+    # Long uptime on a Linux server is not a finding.
+    return "ok", f"up {days}d"
+
+
 # Section name -> rule. Easy to extend: add an entry.
 RULES: dict[str, Rule | OsAwareRule] = {
     "disk": _rule_disk,
@@ -670,6 +890,11 @@ RULES: dict[str, Rule | OsAwareRule] = {
     "logon_failures": _rule_logon_failures,
     "backup_status": _rule_backup_status,
     "net_quality": _rule_net_quality,
+    "services": _rule_services,
+    "encryption": _rule_encryption,
+    "printers": _rule_printers,
+    "time_sync": _rule_time_sync,
+    "uptime": _rule_uptime,
 }
 
 
@@ -683,18 +908,30 @@ RULES: dict[str, Rule | OsAwareRule] = {
 # (sshd/PAM failures from the journal). Its thresholds are OS-neutral, so it is
 # now scored everywhere.
 WINDOWS_ONLY_SECTIONS: frozenset[str] = frozenset(
-    {"defender", "win_update", "reboot_pending", "backup_status"}
+    {"defender", "win_update", "reboot_pending", "backup_status", "encryption"}
 )
 
 # Sections whose *rule* needs to know the agent's OS, as opposed to sections that
 # are skipped wholesale. Kept as a separate registry rather than widening every
-# rule's signature: exactly one rule needs this today, and an explicit list is
-# greppable in a way an inspected signature is not.
-OS_AWARE_RULES: frozenset[str] = frozenset({"local_accounts"})
+# rule's signature: an explicit list is greppable in a way an inspected
+# signature is not.
+OS_AWARE_RULES: frozenset[str] = frozenset({"local_accounts", "services", "uptime"})
 
 
 def _is_windows(agent_os: str | None) -> bool:
     return str(agent_os or "windows").lower() == "windows"
+
+
+def _agent_verdict(reported: Status, summary: str) -> dict[str, Any]:
+    """The section dict when this module has nothing to say and the agent's
+    own ``status`` stands (no rule, or a rule that deferred)."""
+
+    return {
+        "status": reported,
+        "summary": summary,
+        "attention": reported in INCIDENT_STATUSES,
+        "tier": tier_of(reported),
+    }
 
 
 def evaluate_section(
@@ -704,15 +941,17 @@ def evaluate_section(
     now: datetime | None = None,
     agent_os: str = "windows",
 ) -> dict[str, Any]:
-    """Return ``{status, summary, attention, reason?, details?}`` for one
-    section after applying rules.
+    """Return ``{status, summary, attention, tier, reason?, details?}`` for
+    one section after applying rules.
 
-    ``attention`` is ``status != "ok"`` — computed here, alongside ``status``,
+    ``attention`` is ``status in {warn, crit}`` and ``tier`` is
+    ``incident``/``posture``/``none`` — computed here, alongside ``status``,
     and nowhere else (``kenny-server/CLAUDE.md``: "health thresholds live only
     in health_rules.py"). Every consumer (``tools.build_health``,
     ``fleet_stats``, the dashboard's ``_overview``, the MCP ``agent_health``
-    tool) reads it straight off this dict rather than re-deriving it from
-    ``status``.
+    tool) reads them straight off this dict rather than re-deriving them from
+    ``status``. A ``posture`` section is not ``attention``: it is listed and
+    aged, never alarmed on (ADR-0058).
 
     **A rule's verdict is final, not a floor over the agent's own.** When a
     section has a rule and that rule reaches a verdict, that verdict *is* the
@@ -737,17 +976,18 @@ def evaluate_section(
     summary = payload.get("summary", "")
     rule = RULES.get(name)
     if rule is None:
-        return {"status": reported, "summary": summary, "attention": reported != "ok"}
+        return _agent_verdict(reported, summary)
     outcome = (
         rule(payload, now, agent_os) if name in OS_AWARE_RULES else rule(payload, now)
     )
     if outcome is None:
-        return {"status": reported, "summary": summary, "attention": reported != "ok"}
+        return _agent_verdict(reported, summary)
     rule_status, reason = outcome[0], outcome[1]
     result: dict[str, Any] = {
         "status": rule_status,
         "summary": summary,
-        "attention": rule_status != "ok",
+        "attention": rule_status in INCIDENT_STATUSES,
+        "tier": tier_of(rule_status),
         "reason": reason,
     }
     if len(outcome) > 2 and isinstance(outcome[2], dict):

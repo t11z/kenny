@@ -152,3 +152,25 @@ async def test_digest_disabled_or_channelless_is_silent(stores) -> None:
         notifiers=[],
     )
     assert await engine_no_channel.maybe_send_digest(monday) is False
+
+
+async def test_digest_lists_posture_once_and_names_the_finding(stores) -> None:
+    store, events, _ = stores
+    snapshot = {
+        "disk": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": 96.0}]},
+        "encryption": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "protection_status": 0}]},
+        "listening_ports": {"status": "ok", "summary": "", "ports": [
+            {"proto": "tcp", "port": 3389, "address": "0.0.0.0", "pid": 1, "process": "svchost"}]},
+        "win_update": {"status": "ok", "summary": "", "recent": [
+            {"kb": "KB1", "title": "x", "result": "failed", "installed_at": "2026-07-01T01:00:00Z"},
+            {"kb": "KB1", "title": "x", "result": "failed", "installed_at": "2026-06-30T01:00:00Z"},
+            {"kb": "KB1", "title": "x", "result": "failed", "installed_at": "2026-06-29T01:00:00Z"},
+        ]},
+    }
+    await store.insert("kids-pc", NOW.isoformat(), snapshot, received_at=NOW.isoformat())
+    _, body = await build_digest(store, events, FakeRegistry({"kids-pc"}), now=NOW)
+    # Degraded names the finding, not "disk crit".
+    assert "Degraded: kids-pc (crit: disk: C: 96% full (>=95%); win_update: KB1 failed 3×" in body
+    assert "Posture: kids-pc (encryption, listening_ports)" in body
+    # Distinct KBs, not rows.
+    assert "1 failed update(s)" in body

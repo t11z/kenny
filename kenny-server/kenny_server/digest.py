@@ -49,6 +49,7 @@ async def build_digest(
     online = 0
     health_counts = {"ok": 0, "warn": 0, "crit": 0}
     degraded: list[str] = []
+    posture: list[str] = []
     reboots = 0
     failed_updates = 0
     eol_hosts: list[str] = []
@@ -70,17 +71,26 @@ async def build_digest(
         health_counts[overall] = health_counts.get(overall, 0) + 1
         if overall != "ok":
             worst = [
-                f"{name} {sec['status']}"
+                f"{name}: {sec.get('reason') or sec.get('summary') or sec['status']}"
                 for name, sec in evaluation["sections"].items()
                 if sec["status"] == overall
             ]
-            degraded.append(f"{agent_id} ({overall}: {', '.join(worst[:3])})")
+            degraded.append(f"{agent_id} ({overall}: {'; '.join(worst[:3])})")
+        standing = [
+            name for name, sec in evaluation["sections"].items() if sec.get("tier") == "posture"
+        ]
+        if standing:
+            posture.append(f"{agent_id} ({', '.join(standing)})")
 
         if (snapshot.get("reboot_pending") or {}).get("pending") is True:
             reboots += 1
         recent = (snapshot.get("win_update") or {}).get("recent") or []
-        failed_updates += sum(
-            1 for u in recent if str(u.get("result", "")).lower() == "failed"
+        failed_updates += len(
+            {
+                str(u.get("kb") or u.get("title") or "?")
+                for u in recent
+                if isinstance(u, dict) and str(u.get("result", "")).lower() == "failed"
+            }
         )
         if evaluation["sections"].get("os_support", {}).get("status") in ("warn", "crit"):
             eol_hosts.append(agent_id)
@@ -129,6 +139,9 @@ async def build_digest(
     ]
     if degraded:
         lines.append("Degraded: " + "; ".join(degraded[:_MAX_LIST_LINES]))
+    if posture:
+        # Standing facts, once a week and nowhere else (ADR-0058).
+        lines.append("Posture: " + "; ".join(posture[:_MAX_LIST_LINES]))
     lines.append(f"Alerts (7d): {alerts} ({crit_alerts} crit), changes: {changes}.")
     if forecast_lines:
         lines.append("Disks filling: " + "; ".join(forecast_lines[:_MAX_LIST_LINES]))

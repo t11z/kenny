@@ -58,7 +58,12 @@ from .trends import DISK_FULL_ALERT_DAYS, disk_forecast
 
 logger = logging.getLogger("kenny.alerting")
 
-_ORDER = {"ok": 0, "warn": 1, "crit": 2}
+# ``posture`` (ADR-0058) ranks with ``ok``: a posture section never escalates
+# and never recovers, so its transitions only ever update state -- which is
+# what gives a posture finding its age.
+_ORDER = {"ok": 0, "posture": 0, "warn": 1, "crit": 2}
+_INCIDENT = ("warn", "crit")
+_TITLE_MAX = 96
 
 DEFAULT_COOLDOWN_S = 3600
 # Three missed 900 s telemetry pushes (docs/protocol.md § Telemetry).
@@ -298,6 +303,7 @@ class AlertEngine:
         alert_sections: dict[str, str] = {}
         recovery_sections: dict[str, str] = {}
 
+        headline = ""
         for name, section in evaluation["sections"].items():
             scope = f"section:{name}"
             row = state.get(scope)
@@ -305,23 +311,29 @@ class AlertEngine:
             new = section["status"]
             if new == old:
                 continue
+            # The body carries the finding, not the transition: what is wrong
+            # and since when is what a reader acts on; "ok -> crit" is
+            # bookkeeping the Log page already keeps.
             reason = section.get("reason") or section.get("summary") or ""
-            line = f"{name}: {old} -> {new}" + (f" ({reason})" if reason else "")
             notified = False
-            if _ORDER.get(new, 0) > _ORDER.get(old, 0):
+            if new in _INCIDENT and _ORDER.get(new, 0) > _ORDER.get(old, 0):
                 # Escalations to crit always fire; warn respects the cooldown.
                 if new == "crit" or self._cooldown_passed(row, now):
-                    alert_lines.append(line)
+                    alert_lines.append(f"[{new.upper()}] {name}: {reason}".rstrip(": "))
                     alert_sections[name] = new
-                    alert_worst = "crit" if new == "crit" else alert_worst
-                    if alert_worst == "ok":
+                    if new == "crit" and alert_worst != "crit":
+                        alert_worst = "crit"
+                        headline = f"{name}: {reason}" if reason else name
+                    elif alert_worst == "ok":
                         alert_worst = "warn"
+                        headline = f"{name}: {reason}" if reason else name
                     notified = True
             elif new == "ok" and self._episode_was_notified(row):
-                recovery_lines.append(line)
+                recovery_lines.append(f"[RESOLVED] {name}: {reason}".rstrip(": "))
                 recovery_sections[name] = old
                 notified = True
-            # crit -> warn improvements update state silently.
+            # crit -> warn improvements, and every transition into or out of
+            # posture, update state silently (ADR-0058).
             await self._alert_state.upsert(
                 agent_id,
                 scope,
@@ -345,9 +357,12 @@ class AlertEngine:
 
         out: list[Notification] = []
         if alert_lines:
+            title = f"{agent_id}: {headline}"
+            if len(title) > _TITLE_MAX:
+                title = title[: _TITLE_MAX - 1] + "…"
             out.append(
                 Notification(
-                    title=f"{agent_id} health: {overall}",
+                    title=title,
                     body="\n".join(alert_lines),
                     priority="high" if alert_worst == "crit" else "default",
                     tags=["rotating_light" if alert_worst == "crit" else "warning"],

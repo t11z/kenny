@@ -71,15 +71,15 @@ Get-Printer -ErrorAction SilentlyContinue | ForEach-Object {
             .count();
 
         let total = printers.len();
-        let (status, summary) = if bad > 0 {
-            (
-                Status::Warn,
-                format!("{bad} of {total} printers in error/offline"),
-            )
+        // Report, do not grade: an offline printer is a switched-off
+        // peripheral, and whether that is worth anyone's attention is the
+        // server's call (`health_rules._rule_printers`).
+        let summary = if bad > 0 {
+            format!("{bad} of {total} printers in error/offline")
         } else {
-            (Status::Ok, format!("{total} printer(s) OK"))
+            format!("{total} printer(s) OK")
         };
-        Section::with_fields(status, summary, json!({ "printers": printers }))
+        Section::with_fields(Status::Ok, summary, json!({ "printers": printers }))
     }
 }
 
@@ -90,5 +90,11 @@ mod tests {
     #[test]
     fn printers_section_is_valid() {
         assert!(collect().into_value()["printers"].is_array());
+    }
+
+    #[test]
+    fn printers_never_grades_the_host() {
+        // Report, do not grade (ADR-0058): the verdict is `health_rules._rule_printers`'s.
+        assert_eq!(collect().into_value()["status"], "ok");
     }
 }

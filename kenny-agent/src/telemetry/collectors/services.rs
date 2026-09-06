@@ -59,29 +59,38 @@ Get-CimInstance -ClassName Win32_Service | ForEach-Object {
             );
         };
         let services = winps::as_array(v);
-
-        // Auto-start services that are not Running. Ignore "Auto (Delayed)" naming
-        // by matching the StartMode "Auto" prefix.
-        let stalled: Vec<&str> = services
-            .iter()
-            .filter(|s| {
-                let start = s.get("start").and_then(Value::as_str).unwrap_or("");
-                let state = s.get("status").and_then(Value::as_str).unwrap_or("");
-                start.eq_ignore_ascii_case("Auto") && !state.eq_ignore_ascii_case("Running")
-            })
-            .filter_map(|s| s.get("name").and_then(Value::as_str))
-            .collect();
-
-        let total = services.len();
-        let (status, summary) = if stalled.is_empty() {
-            (Status::Ok, format!("{total} services, all auto running"))
-        } else {
-            (
-                Status::Warn,
-                format!("{} auto service(s) stopped", stalled.len()),
-            )
-        };
+        let (status, summary) = grade(&services);
         Section::with_fields(status, summary, json!({ "services": services }))
+    }
+}
+
+/// Summarize the inventory without grading it: the count of auto-start
+/// services that are not running is reported in the summary, and the status
+/// is always `Ok`. Whether an idle auto-start service is a finding is the
+/// server's call (`health_rules._rule_services`) -- on a real PC it is almost
+/// always an updater or trigger-start service idling by design, which the
+/// old `Warn` here turned into a standing alarm the server could never lower.
+#[cfg(windows)]
+fn grade(services: &[Value]) -> (Status, String) {
+    let stalled = services
+        .iter()
+        .filter(|s| {
+            let start = s.get("start").and_then(Value::as_str).unwrap_or("");
+            let state = s.get("status").and_then(Value::as_str).unwrap_or("");
+            start.to_ascii_lowercase().starts_with("auto") && !state.eq_ignore_ascii_case("Running")
+        })
+        .count();
+    let total = services.len();
+    if stalled == 0 {
+        (
+            Status::Ok,
+            format!("{total} services, all auto-start running"),
+        )
+    } else {
+        (
+            Status::Ok,
+            format!("{total} services, {stalled} auto-start not running"),
+        )
     }
 }
 
@@ -135,12 +144,14 @@ mod linux_impl {
             })
             .collect();
 
-        let (status, summary) = if failed.is_empty() {
-            (Status::Ok, "all units healthy".to_string())
+        // Report, do not grade: a failed unit is a finding for the server's
+        // `health_rules._rule_services` to make, not this binary's.
+        let summary = if failed.is_empty() {
+            "all units healthy".to_string()
         } else {
-            (Status::Warn, format!("{} failed unit(s)", failed.len()))
+            format!("{} failed unit(s)", failed.len())
         };
-        Section::with_fields(status, summary, json!({ "services": services }))
+        Section::with_fields(Status::Ok, summary, json!({ "services": services }))
     }
 
     /// Whether `systemctl` stderr indicates the systemd bus is unreachable.
@@ -198,5 +209,21 @@ mod tests {
         assert!(v["services"].is_array());
         // Whatever platform path runs, the section must classify itself.
         assert!(v["status"].is_string());
+    }
+
+    #[test]
+    fn services_never_grades_the_host() {
+        // Report, do not grade (ADR-0058): whether an idle auto-start service or
+        // a failed unit is a finding is `health_rules._rule_services`' call.
+        assert_eq!(collect().into_value()["status"], "ok");
+        #[cfg(windows)]
+        {
+            let stalled = vec![
+                serde_json::json!({"name": "edgeupdate", "start": "Auto", "status": "Stopped"}),
+            ];
+            let (status, summary) = grade(&stalled);
+            assert_eq!(status, Status::Ok);
+            assert!(summary.contains("1 auto-start not running"));
+        }
     }
 }
