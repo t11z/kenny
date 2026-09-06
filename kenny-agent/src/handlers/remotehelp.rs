@@ -97,6 +97,9 @@ mod windows_impl {
     async fn powershell(script: &str, timeout: Duration) -> Result<String, (ErrorCode, String)> {
         let mut cmd = Command::new("powershell.exe");
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        // Kill the probe when the timeout abandons it, rather than leaving it running
+        // on a tokio reaper thread the runtime later joins — see `handlers::powershell`.
+        cmd.kill_on_drop(true);
         let output = match tokio::time::timeout(timeout, cmd.output()).await {
             Ok(res) => {
                 res.map_err(|e| (ErrorCode::ExecFailed, format!("powershell spawn: {e}")))?

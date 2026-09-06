@@ -5,10 +5,15 @@
 //! feeds `dispatch::handle` adversarial `(tool, args)` pairs and asserts the call
 //! never panics, only ever returning an `ok`/`err` response.
 //!
-//! Mutating tools (see `control::is_mutating`) are exercised with remote control at
-//! its default OFF state, so the fuzzer-generated args never reach a handler that
+//! Mutating tools (see `control::is_mutating`) are exercised with the local kill
+//! switch explicitly OFF, so the fuzzer-generated args never reach a handler that
 //! would actually run a shell command, touch an account, or change network config —
-//! they only exercise the `Disabled` short-circuit in `dispatch::run`.
+//! they only exercise the `Disabled` short-circuit in `dispatch::run`. Switching it
+//! off takes a control file that says so: remote control ships **on** and a missing
+//! file reads as enabled (ADR-0011), so an unset `KENNY_CONTROL_FILE` is the *most*
+//! permissive state, not the safest one. [`fuzz_dispatch_never_panics`] asserts the
+//! switch really is off before it fuzzes anything, because nothing else in the test
+//! would notice if it were not.
 //!
 //! Tools are split by whether their handler actually reads `args`:
 //! - [`RANDOM_LOOP_TOOLS`] either deserialize `args` into something handler-specific
@@ -17,11 +22,12 @@
 //!   iteration.
 //! - [`SMOKE_ONCE_TOOLS`] are non-mutating handlers whose top-level signature is
 //!   `_args: Value` (Windows-only diagnostics/network/remotehelp/webfilter status
-//!   reads, `winget_list`): they ignore `args` completely, so randomizing it
-//!   thousands of times adds no coverage, while several of them do a real OS/WMI/
-//!   subprocess call on Windows (e.g. `winget_list` shells out to `winget`) that is
-//!   too slow to repeat thousands of times in CI. Each is called exactly once, which
-//!   is all the args-blind routing path needs. `screen_capture` is deliberately not
+//!   reads): they ignore `args` completely, so randomizing it thousands of times adds
+//!   no coverage, while several of them do a real OS/WMI/subprocess call on Windows
+//!   that is too slow to repeat thousands of times in CI. Each is called exactly once,
+//!   which is all the args-blind routing path needs. Every one of them reaches the OS
+//!   through a probe that kills its child on timeout, so a wedged host costs this test
+//!   a bounded wait and never a stuck one. `screen_capture` is deliberately not
 //!   dispatched for real here at all (not even once) — like the existing
 //!   `dispatch::tests::screen_capture_paused_while_protected_game_runs`, which only
 //!   exercises it behind the coexist gate, its real Windows capture path depends on
@@ -73,6 +79,13 @@ const RANDOM_LOOP_TOOLS: &[&str] = &[
     "🔥unicode_tool🔥",
 ];
 
+/// `winget_list` is deliberately absent, for the same reason `screen_capture` is: its
+/// handler is args-blind, so dispatching it proves only that the tool name routes,
+/// and `winget list` is not a call a unit test can make. It refreshes its sources over
+/// the network before answering, and on a host where that cannot complete — a CI
+/// runner among them — it does not return at all. The handler bounds and kills it, so
+/// the tool is safe to call; spending that bound here buys nothing. `winget`'s real
+/// behaviour belongs to the integration job, which runs against a real desktop.
 const SMOKE_ONCE_TOOLS: &[&str] = &[
     "diag_processes",
     "diag_services",
@@ -81,7 +94,6 @@ const SMOKE_ONCE_TOOLS: &[&str] = &[
     "net_config",
     "remotehelp_status",
     "webfilter_status",
-    "winget_list",
 ];
 
 /// Tiny dependency-free xorshift64* PRNG. Fixed seed so a failure is reproducible.
@@ -240,9 +252,29 @@ async fn dispatch_once(tool: &str, args: Value) -> Result<(), (String, Value)> {
 #[tokio::test]
 async fn fuzz_dispatch_never_panics() {
     let _guard = crate::control::TEST_ENV_LOCK.lock().unwrap();
-    // Default (unset) state is remote-control-disabled, so mutating tools
-    // short-circuit before a handler ever sees the fuzzer-generated args.
-    std::env::remove_var(crate::control::CONTROL_FILE_ENV);
+    // Turn the local kill switch off for the duration, so every mutating tool below
+    // stops at the `Disabled` short-circuit instead of reaching its handler. This
+    // needs a control file that says so — leaving `KENNY_CONTROL_FILE` unset points
+    // at the machine's real state path, and a missing file there reads as *enabled*.
+    let control = std::env::temp_dir().join("kenny-fuzz-dispatch.control.json");
+    std::env::set_var(crate::control::CONTROL_FILE_ENV, &control);
+    crate::control::set_remote_control_enabled(false).expect("write the off state");
+
+    // Prove it before fuzzing: dispatch one mutating tool and require `Disabled`.
+    // Every "this never reaches the OS" claim in this module rests on this gate, and
+    // a fuzz loop cannot tell a refused call from a call that quietly succeeded — so
+    // if the gate is open, the right outcome is a failed test, not 8000 real ones.
+    let gate = handle(Request {
+        id: "fuzz-gate".to_string(),
+        tool: "winget_install".to_string(),
+        args: json!({"id": "kenny.fuzz.gate.probe"}),
+    })
+    .await;
+    assert_eq!(
+        gate.error.map(|e| e.code),
+        Some(crate::protocol::ErrorCode::Disabled),
+        "the kill switch is not off, so this fuzz loop would run mutating tools for real"
+    );
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut panics: Vec<(String, Value)> = Vec::new();
@@ -274,6 +306,9 @@ async fn fuzz_dispatch_never_panics() {
             panics.push(p);
         }
     }
+
+    std::env::remove_var(crate::control::CONTROL_FILE_ENV);
+    let _ = std::fs::remove_file(&control);
 
     assert!(
         panics.is_empty(),

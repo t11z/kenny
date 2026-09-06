@@ -37,6 +37,14 @@ async fn run(args: &Args) -> Result<Value, (ErrorCode, String)> {
 
     let mut cmd = Command::new("powershell.exe");
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", &args.script]);
+    // The timeout below abandons the `output()` future, and an abandoned child is not
+    // killed unless we ask for it. On Windows tokio reaps each child on a blocking
+    // wait thread that the runtime's shutdown joins, so an abandoned child holds that
+    // thread — and the runtime — for as long as the real process keeps running,
+    // however long after we reported `timeout` that is. `kill_on_drop` ends the child
+    // with the future, which is also what the caller means by a timeout: stop the
+    // work, not just stop waiting for it.
+    cmd.kill_on_drop(true);
     let fut = cmd.output();
 
     let output = match args.timeout_s {
@@ -89,6 +97,41 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, ErrorCode::Timeout);
+    }
+
+    /// A timeout must stop the work, not just stop waiting for it.
+    ///
+    /// Without `kill_on_drop` the abandoned child runs to completion behind our back:
+    /// the caller is told `timeout` while the command it asked us to stop carries on.
+    /// On Windows that also pins the tokio reaper thread the runtime's shutdown joins,
+    /// which is how one wedged child can hold a whole test binary open. The marker file
+    /// is written only by the half of the command that runs *after* the timeout fires,
+    /// so its absence is the proof the child died with the future.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timeout_kills_the_child_instead_of_abandoning_it() {
+        let marker = std::env::temp_dir().join(format!("kenny-ps-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let err = exec(json!({
+            "script": format!(
+                "Start-Sleep -Seconds 2; New-Item -ItemType File -Path '{}' | Out-Null",
+                marker.display()
+            ),
+            "timeout_s": 1,
+        }))
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ErrorCode::Timeout);
+
+        // Outlast the script's own sleep, so a surviving child would have written by now.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !survived,
+            "the timed-out script kept running after we gave up on it"
+        );
     }
 
     #[cfg(not(windows))]

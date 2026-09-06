@@ -220,9 +220,15 @@ mod windows_impl {
     /// `winget_list` real implementation: run `winget list` and parse its
     /// fixed-width table into `{id,name,version,available}` rows.
     pub async fn list() -> Result<Value, (ErrorCode, String)> {
-        let fut = Command::new("winget")
-            .args(["list", "--accept-source-agreements"])
-            .output();
+        let mut cmd = Command::new("winget");
+        cmd.args(["list", "--accept-source-agreements"]);
+        // Required for the timeout below to mean anything: a `winget` that has stopped
+        // answering does not stop running, and on Windows tokio waits on each child
+        // from a blocking thread the runtime's shutdown joins — so abandoning one
+        // without killing it holds the runtime for as long as `winget` lives, which
+        // for a wedged source refresh is indefinitely. See `handlers::powershell`.
+        cmd.kill_on_drop(true);
+        let fut = cmd.output();
         let output = tokio::time::timeout(LIST_TIMEOUT, fut)
             .await
             .map_err(|_| {
