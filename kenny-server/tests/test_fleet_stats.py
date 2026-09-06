@@ -221,6 +221,43 @@ def test_overview_handles_agent_without_snapshot():
     assert [m["agent_id"] for m in unknown["members"]] == ["new-pc"]
 
 
+def test_overview_tolerates_malformed_list_entries_and_non_finite_numbers():
+    """Every list field below (``encryption.volumes``, ``firewall.profiles``,
+    ``disk.volumes``, ``win_update.recent``) is an unvalidated agent-reported list
+    (``Section`` allows extra fields with no shape check) -- a compromised or buggy
+    agent putting a non-dict entry there, or a huge/non-finite number in a numeric
+    field, previously crashed the whole-fleet Overview aggregation (AttributeError
+    on `.get()` of a non-dict entry, OverflowError from `_num`/`float()`), not just
+    the offending host's own read.
+    """
+
+    # NB: recent_crashes/stability_index are deliberately not exercised for the
+    # overflow/non-finite case here -- health_rules.evaluate_snapshot (invoked by
+    # this test's own `_agent()` helper via `build_health`) scores reliability
+    # from those fields on its own path, so `memory.percent_used` alone is enough
+    # to prove this module's own `_num` (imported from `health_rules._number`).
+    bogus = {
+        "encryption": {"status": "warn", "summary": "", "volumes": ["not-a-dict"]},
+        "firewall": {"status": "warn", "summary": "", "profiles": ["not-a-dict"]},
+        "disk": {"status": "warn", "summary": "", "volumes": [123, {"mount": "C:", "percent_used": 50}]},
+        "win_update": {"status": "warn", "summary": "", "recent": ["not-a-dict", {"kb": "KB1", "result": "failed"}]},
+        "memory": {"status": "ok", "summary": "", "percent_used": int("9" * 320)},
+    }
+    agents = [_agent("bogus-1", bogus, meta={"os": "windows"})]
+
+    out = fleet_stats.aggregate_overview(agents, now=NOW)  # must not raise
+
+    assert out["agent_count"] == 1
+    # The one real dict entry in each malformed list still gets scored.
+    posture = {m["key"]: m for m in out["posture"]["metrics"]}
+    assert posture["encryption"]["unknown"] == 1  # no valid volume entry -> unknown, not compliant/noncompliant
+    assert posture["firewall"]["unknown"] == 1
+    top = {m["key"]: m for m in out["top"]["metrics"]}
+    assert [e["value"] for e in top["disk"]["entries"]] == [50]
+    kpis = {k["key"]: k for k in out["kpis"]}
+    assert kpis["failed_updates"]["value"] == 1
+
+
 def test_trend_buckets_by_day():
     points = {
         "a": [
