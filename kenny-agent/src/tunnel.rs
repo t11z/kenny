@@ -219,7 +219,7 @@ async fn serve_once(
                     continue;
                 }
             };
-            if let Err(e) = sink.send(Message::Text(text)).await {
+            if let Err(e) = sink.send(Message::Text(text.into())).await {
                 warn!(error = %e, "write failed; closing session");
                 break;
             }
@@ -683,9 +683,11 @@ mod tests {
                 server_nonce: STANDARD.encode(server_nonce_raw),
                 server_sig,
             });
-            ws.send(Message::Text(serde_json::to_string(&challenge).unwrap()))
-                .await
-                .unwrap();
+            ws.send(Message::Text(
+                serde_json::to_string(&challenge).unwrap().into(),
+            ))
+            .await
+            .unwrap();
 
             // 3. auth — must verify under the AGENT public key over the same transcript.
             let auth = match next_frame(&mut ws).await {
@@ -702,7 +704,7 @@ mod tests {
                 tool: "__test_probe__".to_string(),
                 args: serde_json::json!({}),
             });
-            ws.send(Message::Text(serde_json::to_string(&req).unwrap()))
+            ws.send(Message::Text(serde_json::to_string(&req).unwrap().into()))
                 .await
                 .unwrap();
             // Drain frames until we see the response to our request (telemetry/heartbeat
@@ -770,9 +772,11 @@ mod tests {
                 server_nonce: STANDARD.encode(server_nonce_raw),
                 server_sig: bad_sig,
             });
-            ws.send(Message::Text(serde_json::to_string(&challenge).unwrap()))
-                .await
-                .unwrap();
+            ws.send(Message::Text(
+                serde_json::to_string(&challenge).unwrap().into(),
+            ))
+            .await
+            .unwrap();
 
             // Immediately push a request, as a hostile/MITM server would, to try to drive
             // a tool handler before auth.
@@ -781,7 +785,7 @@ mod tests {
                 tool: "__test_probe__".to_string(),
                 args: serde_json::json!({}),
             });
-            ws.send(Message::Text(serde_json::to_string(&req).unwrap()))
+            ws.send(Message::Text(serde_json::to_string(&req).unwrap().into()))
                 .await
                 .unwrap();
 
