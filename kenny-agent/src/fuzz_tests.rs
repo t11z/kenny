@@ -17,11 +17,12 @@
 //!   iteration.
 //! - [`SMOKE_ONCE_TOOLS`] are non-mutating handlers whose top-level signature is
 //!   `_args: Value` (Windows-only diagnostics/network/remotehelp/webfilter status
-//!   reads, `winget_list`): they ignore `args` completely, so randomizing it
-//!   thousands of times adds no coverage, while several of them do a real OS/WMI/
-//!   subprocess call on Windows (e.g. `winget_list` shells out to `winget`) that is
-//!   too slow to repeat thousands of times in CI. Each is called exactly once, which
-//!   is all the args-blind routing path needs. `screen_capture` is deliberately not
+//!   reads): they ignore `args` completely, so randomizing it thousands of times adds
+//!   no coverage, while several of them do a real OS/WMI/subprocess call on Windows
+//!   that is too slow to repeat thousands of times in CI. Each is called exactly once,
+//!   which is all the args-blind routing path needs. Every one of them reaches the OS
+//!   through a probe that kills its child on timeout, so a wedged host costs this test
+//!   a bounded wait and never a stuck one. `screen_capture` is deliberately not
 //!   dispatched for real here at all (not even once) — like the existing
 //!   `dispatch::tests::screen_capture_paused_while_protected_game_runs`, which only
 //!   exercises it behind the coexist gate, its real Windows capture path depends on
@@ -73,6 +74,13 @@ const RANDOM_LOOP_TOOLS: &[&str] = &[
     "🔥unicode_tool🔥",
 ];
 
+/// `winget_list` is deliberately absent, for the same reason `screen_capture` is: its
+/// handler is args-blind, so dispatching it proves only that the tool name routes,
+/// and `winget list` is not a call a unit test can make. It refreshes its sources over
+/// the network before answering, and on a host where that cannot complete — a CI
+/// runner among them — it does not return at all. The handler bounds and kills it, so
+/// the tool is safe to call; spending that bound here buys nothing. `winget`'s real
+/// behaviour belongs to the integration job, which runs against a real desktop.
 const SMOKE_ONCE_TOOLS: &[&str] = &[
     "diag_processes",
     "diag_services",
@@ -81,7 +89,6 @@ const SMOKE_ONCE_TOOLS: &[&str] = &[
     "net_config",
     "remotehelp_status",
     "webfilter_status",
-    "winget_list",
 ];
 
 /// Tiny dependency-free xorshift64* PRNG. Fixed seed so a failure is reproducible.

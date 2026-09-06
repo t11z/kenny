@@ -32,6 +32,10 @@ async fn run(args: &Args) -> Result<Value, (ErrorCode, String)> {
 
     let mut cmd = Command::new("sh");
     cmd.args(["-c", &args.command]);
+    // A timed-out call abandons the `output()` future; without this the child survives
+    // it and keeps doing whatever the caller asked us to stop. See the same call in
+    // `handlers::powershell`, where abandoning it also pins a tokio reaper thread.
+    cmd.kill_on_drop(true);
     let fut = cmd.output();
 
     let output = match args.timeout_s {
@@ -84,6 +88,39 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, ErrorCode::Timeout);
+    }
+
+    /// A timeout must stop the work, not just stop waiting for it.
+    ///
+    /// Without `kill_on_drop` the abandoned child runs to completion behind our back:
+    /// the caller is told `timeout` while the command it asked us to stop carries on.
+    /// On Windows that also pins the tokio reaper thread the runtime's shutdown joins,
+    /// which is how one wedged child can hold a whole test binary open. The marker file
+    /// is written only by the half of the command that runs *after* the timeout fires,
+    /// so its absence is the proof the child died with the future.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn timeout_kills_the_child_instead_of_abandoning_it() {
+        let marker =
+            std::env::temp_dir().join(format!("kenny-shell-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let err = exec(json!({
+            "command": format!("sleep 2; : > '{}'", marker.display()),
+            "timeout_s": 1,
+        }))
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ErrorCode::Timeout);
+
+        // Outlast the command's own sleep, so a surviving child would have written by now.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !survived,
+            "the timed-out command kept running after we gave up on it"
+        );
     }
 
     #[cfg(windows)]
