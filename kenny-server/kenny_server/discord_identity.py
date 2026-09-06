@@ -185,6 +185,9 @@ class DiscordLinkClaim:
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    # POSSIBLY DEAD: the real consume path checks `consumed_at IS NULL AND
+    # expires_at > ?` directly in SQL rather than calling this. Only tests
+    # exercise this method.
     def is_open(self, now: datetime | str | None = None) -> bool:
         """True while the claim can still be consumed."""
 
