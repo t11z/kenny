@@ -101,6 +101,33 @@ def test_disk_thresholds() -> None:
     assert ok["status"] == "ok"
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), int("9" * 320)])
+def test_disk_non_finite_or_oversized_percent_does_not_crash(bad: float) -> None:
+    """``percent_used`` is an unvalidated agent-reported field. A JSON int too large
+    to represent as a float used to crash `_rule_disk` at `float(pct)`/the `:.0f`
+    format (`OverflowError`), and Infinity/NaN (which Python's `json` module
+    accepts on decode) compared fine but were never guarded either.
+    """
+
+    result = health_rules.evaluate_section(
+        "disk", {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": bad}]},
+        now=NOW,
+    )
+    assert result["status"] in ("ok", "warn", "crit")
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), int("9" * 320)])
+def test_battery_and_memory_non_finite_or_oversized_percent_does_not_crash(bad: float) -> None:
+    battery = health_rules.evaluate_section(
+        "battery", {"status": "ok", "summary": "", "health_percent": bad}, now=NOW
+    )
+    assert battery["status"] in ("ok", "warn", "crit")
+    memory = health_rules.evaluate_section(
+        "memory", {"status": "ok", "summary": "", "percent_used": bad}, now=NOW
+    )
+    assert memory["status"] in ("ok", "warn", "crit")
+
+
 def test_os_support_eol() -> None:
     crit = health_rules.evaluate_section(
         "os_support", {"status": "ok", "summary": "", "eol": True}, now=NOW
@@ -118,6 +145,16 @@ def test_thermals_thresholds() -> None:
     assert _eval([40.0, 97.0])["status"] == "crit"
     assert _eval([40.0, 88.0])["status"] == "warn"
     assert _eval([40.0, 61.0])["status"] == "ok"
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), int("9" * 320)])
+def test_thermals_non_finite_or_oversized_temperature_does_not_crash(bad: float) -> None:
+    result = health_rules.evaluate_section(
+        "thermals",
+        {"status": "ok", "summary": "", "sensors": [{"label": "zone0", "temperature_c": bad}]},
+        now=NOW,
+    )
+    assert result["status"] in ("ok", "warn", "crit")
 
 
 def test_thermals_no_sensors_defers_to_agent() -> None:
@@ -462,6 +499,24 @@ def test_reliability_defers_when_no_fields() -> None:
     assert "reason" not in result
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), int("9" * 320)])
+def test_number_rejects_non_finite_and_oversized_values(bad: float) -> None:
+    """`_number` is the coercion every rule above (and `_reliability_reason`,
+    `_cadence_label`, the accounts/backup rules) applies to unvalidated telemetry
+    fields. A JSON int too large for `float()` (`OverflowError`) and the
+    `Infinity`/`NaN` decode extension must both come back as None, not raise.
+    """
+
+    assert health_rules._number(bad) is None
+
+
+def test_number_still_coerces_real_numbers() -> None:
+    assert health_rules._number(42) == 42.0
+    assert health_rules._number(3.5) == 3.5
+    assert health_rules._number(True) is None
+    assert health_rules._number("42") is None
+
+
 def test_worst_of() -> None:
     assert health_rules.worst("ok", "warn", "crit") == "crit"
     assert health_rules.worst("ok", "warn") == "warn"
@@ -710,6 +765,21 @@ def test_net_quality_rules() -> None:
         now=NOW,
     )
     assert ok["status"] == "ok"
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), int("9" * 320)])
+def test_net_quality_non_finite_or_oversized_metrics_does_not_crash(bad: float) -> None:
+    result = health_rules.evaluate_section(
+        "net_quality",
+        {
+            "status": "ok",
+            "summary": "",
+            "gateway": {"host": "192.168.1.1", "latency_ms": bad, "loss_percent": bad},
+            "reference": {"host": "1.1.1.1", "latency_ms": bad, "loss_percent": bad},
+        },
+        now=NOW,
+    )
+    assert result["status"] in ("ok", "warn", "crit")
 
 
 # -- reliability: alarm suppression (ADR-0041 / issue #166) -----------------

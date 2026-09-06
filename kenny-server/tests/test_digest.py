@@ -91,6 +91,25 @@ async def test_build_digest_empty_fleet(stores) -> None:
     assert body == "No agents have reported telemetry yet."
 
 
+async def test_build_digest_tolerates_malformed_list_entries(stores) -> None:
+    """``win_update.recent`` and ``screen_time.days`` are unvalidated agent-reported
+    lists (``Section`` allows extra fields with no shape check) -- a compromised or
+    buggy agent putting non-dict entries there must not crash the digest for the
+    whole fleet (it previously did: AttributeError on `.get()` of a str/int entry).
+    """
+
+    store, events, _ = stores
+    snapshot = {
+        "win_update": {"status": "warn", "summary": "", "recent": ["not-a-dict", 42, None]},
+        "screen_time": {"status": "ok", "summary": "", "days": ["also-not-a-dict", 7]},
+    }
+    await store.insert("kids-pc", NOW.isoformat(), snapshot, received_at=NOW.isoformat())
+
+    title, body = await build_digest(store, events, FakeRegistry({"kids-pc"}), now=NOW)
+    assert "2026-07-01" in title
+    assert body  # did not raise
+
+
 def make_engine(stores, notifier, **kwargs) -> AlertEngine:
     store, events, state = stores
     return AlertEngine(

@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .health_rules import evaluate_snapshot
+from .health_rules import _dicts, evaluate_snapshot
 from .registry import AgentRegistry
 from .store import EventStore, TelemetryStore
 from .trends import DISK_FULL_KPI_DAYS, battery_trend, disk_forecast
@@ -84,12 +84,12 @@ async def build_digest(
 
         if (snapshot.get("reboot_pending") or {}).get("pending") is True:
             reboots += 1
-        recent = (snapshot.get("win_update") or {}).get("recent") or []
+        recent = _dicts((snapshot.get("win_update") or {}).get("recent"))
         failed_updates += len(
             {
                 str(u.get("kb") or u.get("title") or "?")
                 for u in recent
-                if isinstance(u, dict) and str(u.get("result", "")).lower() == "failed"
+                if str(u.get("result", "")).lower() == "failed"
             }
         )
         if evaluation["sections"].get("os_support", {}).get("status") in ("warn", "crit"):
@@ -109,7 +109,7 @@ async def build_digest(
             )
 
         screen = snapshot.get("screen_time") or {}
-        days = screen.get("days") or []
+        days = _dicts(screen.get("days"))
         minutes = sum(
             d.get("active_minutes", 0)
             for d in days

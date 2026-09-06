@@ -16,6 +16,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .health_rules import _dicts, _number as _num
+
 # An agent record as assembled by the web layer.
 #   {"agent_id", "online", "meta", "snapshot" | None, "health", "collected_at"}
 Agent = dict[str, Any]
@@ -34,10 +36,6 @@ def _section(snapshot: dict[str, Any] | None, name: str) -> dict[str, Any] | Non
         return None
     payload = snapshot.get(name)
     return payload if isinstance(payload, dict) else None
-
-
-def _num(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _agent_os(agent: Agent) -> str:
@@ -209,7 +207,7 @@ def _kpis(
 
         wu = _section(snap, "win_update")
         if wu:
-            failed = [u for u in (wu.get("recent") or []) if str(u.get("result", "")).lower() == "failed"]
+            failed = [u for u in _dicts(wu.get("recent")) if str(u.get("result", "")).lower() == "failed"]
             if failed:
                 failed_total += len(failed)
                 kbs = ", ".join(str(u.get("kb") or "?") for u in failed)
@@ -412,7 +410,7 @@ def _security_posture(agents: list[Agent]) -> dict[str, Any]:
 
         enc = _section(snap, "encryption")
         sysvol = None
-        for vol in (enc.get("volumes") if enc else []) or []:
+        for vol in _dicts(enc.get("volumes") if enc else None):
             if str(vol.get("mount", "")).upper().startswith("C"):
                 sysvol = vol
                 break
@@ -438,7 +436,7 @@ def _security_posture(agents: list[Agent]) -> dict[str, Any]:
             metrics["defender_realtime"]["unknown"].append(_member(aid, None, "no defender telemetry"))
 
         fw = _section(snap, "firewall")
-        profiles = (fw.get("profiles") if fw else None) or []
+        profiles = _dicts(fw.get("profiles") if fw else None)
         if not profiles:
             metrics["firewall"]["unknown"].append(_member(aid, None, "no firewall telemetry"))
         elif all(p.get("enabled") is True for p in profiles):
@@ -475,7 +473,7 @@ def _top_metrics(agents: list[Agent]) -> dict[str, Any]:
 
         d = _section(snap, "disk")
         worst_pct, worst_mount = -1.0, ""
-        for vol in (d.get("volumes") if d else []) or []:
+        for vol in _dicts(d.get("volumes") if d else None):
             pct = _num(vol.get("percent_used"))
             if pct is not None and pct > worst_pct:
                 worst_pct, worst_mount = pct, str(vol.get("mount", "?"))

@@ -13,6 +13,7 @@ health via worst-of.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -135,9 +136,9 @@ def _rule_disk(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | 
     worst_pct = -1.0
     worst_mount = ""
     for vol in _dicts(payload.get("volumes")):
-        pct = vol.get("percent_used")
-        if isinstance(pct, (int, float)) and pct > worst_pct:
-            worst_pct = float(pct)
+        pct = _number(vol.get("percent_used"))
+        if pct is not None and pct > worst_pct:
+            worst_pct = pct
             worst_mount = vol.get("mount", "?")
     if worst_pct < 0:
         return None
@@ -260,8 +261,8 @@ def _rule_reboot_pending(payload: dict[str, Any], now: datetime) -> "tuple[Statu
 
 
 def _rule_battery(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
-    health = payload.get("health_percent")
-    if isinstance(health, (int, float)):
+    health = _number(payload.get("health_percent"))
+    if health is not None:
         if health < 50:
             return "crit", f"Battery health {health:.0f}% (<50%)"
         if health < 70:
@@ -270,8 +271,8 @@ def _rule_battery(payload: dict[str, Any], now: datetime) -> "tuple[Status, str]
 
 
 def _rule_memory(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
-    pct = payload.get("percent_used")
-    if isinstance(pct, (int, float)):
+    pct = _number(payload.get("percent_used"))
+    if pct is not None:
         if pct > 95:
             return "crit", f"Memory {pct:.0f}% used (>95%)"
         if pct > 85:
@@ -282,11 +283,7 @@ def _rule_memory(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] 
 
 def _rule_thermals(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
     sensors = _dicts(payload.get("sensors"))
-    temps = [
-        s.get("temperature_c")
-        for s in sensors
-        if isinstance(s.get("temperature_c"), (int, float))
-    ]
+    temps = [t for s in sensors if (t := _number(s.get("temperature_c"))) is not None]
     if not temps:
         return None  # no sensors reported -> defer to agent status
     hottest = max(temps)
@@ -311,9 +308,29 @@ def _rule_os_support(payload: dict[str, Any], now: datetime) -> "tuple[Status, s
 
 
 def _number(value: Any) -> float | None:
-    """Coerce a JSON number to float, rejecting bools and non-numerics."""
+    """Coerce a JSON number to float, rejecting bools, non-numerics, and anything
+    that can't survive being turned into a real ``float`` (an oversized int, or a
+    non-finite float).
 
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    Every caller reads this straight off an unvalidated ``telemetry_collect``
+    field (same threat model as :func:`_dicts`/:func:`_valid_status`) and then
+    either compares it or formats it with ``:.0f``/feeds it to ``int()``. JSON
+    allows two shapes that break that unguarded: an int with far more digits
+    than a float can represent (``float()`` raises ``OverflowError`` -- e.g. a
+    300-digit ``percent_used``) and Python's ``json`` module's ``Infinity``/
+    ``-Infinity``/``NaN`` decode extension (formats fine but is never a usable
+    reading). Both come back as None, the same "field absent/unusable" path a
+    missing field already took, rather than reaching a caller's comparison,
+    ``:.0f`` format, or ``int()`` cast and crashing there.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
+    return result if math.isfinite(result) else None
 
 
 # -- reliability: activity- and persistence-based pattern scoring ------------
@@ -741,14 +758,14 @@ def _rule_backup_status(payload: dict[str, Any], now: datetime) -> "tuple[Status
 
 def _rule_net_quality(payload: dict[str, Any], now: datetime) -> "tuple[Status, str] | None":
     reference = _as_dict(payload.get("reference"))
-    ref_loss = reference.get("loss_percent")
-    if isinstance(ref_loss, (int, float)) and ref_loss >= 60:
+    ref_loss = _number(reference.get("loss_percent"))
+    if ref_loss is not None and ref_loss >= 60:
         return "crit", f"internet degraded ({ref_loss:.0f}% loss to {reference.get('host', '?')})"
     gateway = _as_dict(payload.get("gateway"))
-    latency = gateway.get("latency_ms")
-    loss = gateway.get("loss_percent")
-    slow = isinstance(latency, (int, float)) and latency > 100
-    lossy = isinstance(loss, (int, float)) and loss > 20
+    latency = _number(gateway.get("latency_ms"))
+    loss = _number(gateway.get("loss_percent"))
+    slow = latency is not None and latency > 100
+    lossy = loss is not None and loss > 20
     if slow or lossy:
         parts = []
         if slow:
