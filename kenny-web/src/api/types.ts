@@ -438,6 +438,11 @@ export interface AdminSection {
  *
  * `#/admin` with no section resolves to the first server-provided group. Do not
  * invent a placeholder slug.
+ *
+ * POSSIBLY DEAD: nothing in the console actually uses this type as an
+ * annotation — section keys are typed `string` at every call site. Only
+ * `settingsMap.ts` names it, in a comment. Kept for the documentation above,
+ * which describes real section-list behavior.
  */
 export type AdminSectionKey = string
 

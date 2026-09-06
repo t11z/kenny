@@ -207,6 +207,9 @@ class AgentTokenStore:
             for r in rows
         ]
 
+    # POSSIBLY DEAD: distribution.py's lazy-mint flow (ADR-0053) does not
+    # currently call this to check whether a token was already minted — only
+    # tests call it directly.
     async def has_token(self, agent_id: str) -> bool:
         """True iff a credential exists for ``agent_id`` (no token material read).
 

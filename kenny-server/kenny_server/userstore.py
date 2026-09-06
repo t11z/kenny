@@ -332,6 +332,9 @@ class UserStore:
         )
         await self._conn.commit()
 
+    # POSSIBLY DEAD: no production caller reads a raw TOTP secret back out —
+    # verification goes through `security.verify_totp` against the stored
+    # value, not through this. Only tests call it directly.
     async def get_totp_secret(self, user_id: int) -> str | None:
         row = await self._get_row(user_id)
         return row["totp_secret"] if row else None

@@ -169,6 +169,9 @@ class KeyStore:
         )
         await self._conn.commit()
 
+    # POSSIBLY DEAD: no webui route or MCP tool calls this today — only tests
+    # exercise it directly. Kept because it is the only re-key path described
+    # by its own docstring below.
     async def rotate(self, agent_id: str, public_key_b64: str) -> None:
         """Replace an agent's public key, demoting the old one to a grace key.
 
