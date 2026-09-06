@@ -202,7 +202,7 @@ mod windows_impl {
     }
 
     /// Build the section from a parsed live `w32tm` status.
-    fn query_section(qs: &core::QueryStatus) -> Section {
+    pub(super) fn query_section(qs: &core::QueryStatus) -> Section {
         let (summary, synchronized) = core::classify_query(qs);
         Section::with_fields(
             Status::Ok,
@@ -426,11 +426,27 @@ mod tests {
 
     #[test]
     fn time_sync_never_grades_the_host() {
-        // Report, do not grade (ADR-0058): every path -- a live reading, a big
-        // skew, an idle or missing service -- is `Ok`; `health_rules._rule_time_sync`
-        // owns the verdict from the `synchronized`/`offset_secs` fields.
-        let v = collect().into_value();
-        assert_eq!(v["status"], "ok");
+        // Report, do not grade (ADR-0058): even the worst live reading -- a
+        // large skew from a non-network source -- is `Ok`, with the fields the
+        // server's `health_rules._rule_time_sync` judges from carried intact.
+        // Built from a synthetic status, never from a real `w32tm` probe: that
+        // call trigger-starts the Windows Time service and can block for
+        // minutes on a CI runner.
+        #[cfg(windows)]
+        {
+            let qs = core::QueryStatus {
+                source: Some("Local CMOS Clock".into()),
+                offset_secs: Some(-42.5),
+            };
+            let v = windows_impl::query_section(&qs).into_value();
+            assert_eq!(v["status"], "ok");
+            assert_eq!(v["synchronized"], false);
+            assert_eq!(v["offset_secs"], -42.5);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(collect().into_value()["status"], "ok");
+        }
     }
 
     #[test]
