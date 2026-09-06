@@ -36,6 +36,9 @@ DEFAULT_REPO = "nullthrone/kenny"
 #   windows: kenny-agent-<tag>-x86_64-pc-windows-msvc.exe
 #   linux:   kenny-agent-<tag>-<arch>-unknown-linux-musl  (arch: x86_64 | aarch64)
 ASSET_RE = re.compile(r"^kenny-agent-.*-x86_64-pc-windows-msvc\.exe$")
+# POSSIBLY DEAD: `_asset_re()` below builds its own linux pattern inline rather
+# than reusing this constant, so nothing in this module reads it — only tests
+# match against it directly.
 LINUX_ASSET_RE = re.compile(r"^kenny-agent-.*-(x86_64|aarch64)-unknown-linux-musl$")
 LINUX_ARCHES = ("x86_64", "aarch64")
 # The (os, arch) combinations we actually ship a binary for — the authoritative list

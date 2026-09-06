@@ -554,7 +554,8 @@ class ToolExecutor:
         snapshot = latest["snapshot"] if latest else None
         agent_os = agent.os if agent else "windows"
         health = build_health(snapshot, agent_os=agent_os)
-        flagged = [n for n, s in health["sections"].items() if s["status"] in ("warn", "crit")]
+        flagged = [n for n, s in health["sections"].items() if s["attention"]]
+        posture = [n for n, s in health["sections"].items() if s.get("tier") == "posture"]
         return {
             "agent_id": agent_id,
             "online": bool(agent and agent.online),
@@ -562,6 +563,7 @@ class ToolExecutor:
             "meta": agent.meta if agent else {},
             "overall": health["overall"],
             "flagged_sections": flagged,
+            "posture_sections": posture,
             "collected_at": latest["collected_at"] if latest else None,
         }
 

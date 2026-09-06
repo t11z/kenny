@@ -21,6 +21,15 @@ not on every push:
 - **A recovery is only announced if the degrading episode was itself announced.** An
   improvement that nobody was told about stays silent, and `crit→warn` updates state
   quietly.
+- **Posture never notifies.** A section in the `posture` tier (an unencrypted drive, a
+  remote-access port, idle updater services — see the status model in
+  [telemetry.md](telemetry.md#status-model)) is a standing fact, not an event: every
+  transition into or out of it only updates state, which is what gives the finding its
+  age on the host page. It is listed once a week in the digest's `Posture:` line.
+- **The body is the finding, not the transition.** A line reads
+  `[CRIT] disk: C: 97% full (>=95%)` and a recovery `[RESOLVED] disk: C: 50% full`; the
+  title names the worst escalated section's reason. The `ok -> crit` bookkeeping stays
+  on the Log page.
 
 The persisted flap-suppression state means a server restart never re-fires alerts for
 conditions that were already notified.

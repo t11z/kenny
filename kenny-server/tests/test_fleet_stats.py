@@ -560,3 +560,16 @@ def test_fleet_overview_uses_persisted_classification_without_a_client(tmp_path,
             assert rc["cells"][0]["count"] == 40
     finally:
         event_categories.reset_state()
+
+
+def test_health_mix_and_section_severity_ignore_posture():
+    # A posture-only host is an ok host in the donut and contributes no row
+    # to the per-section severity bars (ADR-0058).
+    a = _agent("posture-pc", {
+        "encryption": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "protection_status": 0}]},
+        "disk": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "percent_used": 10}]},
+    })
+    assert a["health"]["overall"] == "ok"
+    out = fleet_stats.aggregate_overview([a], now=NOW)
+    assert [(s["key"], s["value"]) for s in out["health"]["segments"]] == [("ok", 1)]
+    assert out["sections"]["rows"] == []

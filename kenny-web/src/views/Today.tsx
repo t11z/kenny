@@ -7,6 +7,7 @@ import Sparkline from '../components/Sparkline/Sparkline'
 import EmptyState from '../components/EmptyState/EmptyState'
 import { severityColor } from '../components/tone'
 import { splitVerdict, todayEyebrow, kpiColor, kpiValue } from './today/format'
+import { formatSince } from './host/format'
 import styles from './today/Today.module.css'
 
 /** Today's row severity domain (`crit`/`warn`/`held`) isn't the shared `Severity`
@@ -71,7 +72,10 @@ export default function Today() {
       </h1>
 
       {allQuiet ? (
-        <p className={styles.calm}>Nothing needs a decision from you right now.</p>
+        <p className={styles.calm}>
+          Nothing needs a decision from you right now.
+          {data.posture_line && ` ${data.posture_line}.`}
+        </p>
       ) : (
         <p className={styles.subtitle}>Ranked by consequence. Work top to bottom; the rest of the fleet can wait.</p>
       )}
@@ -89,13 +93,17 @@ export default function Today() {
               </span>
               <span className="kc-cell">
                 <span className={styles.rowTitle}>{it.host ? `${it.host} — ${it.title}` : it.title}</span>
-                <span className={styles.rowDetail}>{it.detail}</span>
+                <span className={styles.rowDetail}>
+                  {it.detail}
+                  {formatSince(it.age_seconds) && ` · ${formatSince(it.age_seconds)}`}
+                </span>
               </span>
               <span className={`${styles.rowAction} kc-rowaction`}>{it.action} →</span>
             </Link>
           ))}
         </div>
       )}
+      {!allQuiet && data.posture_line && <p className={styles.calm}>{data.posture_line}; see each host page.</p>}
 
       <div className={`${styles.healthRow} kc-2col`}>
         <div className={styles.donutWrap}>

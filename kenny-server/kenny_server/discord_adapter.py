@@ -268,6 +268,9 @@ class DiscordGateway(Protocol):
 
     async def list_guild_members(self, *, guild_id: str) -> list[GuildMember]: ...
 
+    # POSSIBLY DEAD: nothing calls a gateway's `member_role_ids` today —
+    # routing/visibility decisions don't consult Discord roles yet, despite
+    # what this docstring describes. Only tests exercise it.
     async def member_role_ids(self, *, guild_id: str, user_id: str) -> frozenset[str]:
         """Return the caller's Discord role IDs (snowflakes) in ``guild_id``.
 

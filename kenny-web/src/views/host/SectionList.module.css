@@ -76,3 +76,51 @@
   min-height: 44px;
   box-sizing: border-box;
 }
+
+/* Posture (ADR-0058): standing facts, one compact row each, muted — the point
+   is that they are known and aged, not new. */
+.postureList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 36px;
+}
+
+.postureRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  background: transparent;
+  border: 1px solid var(--border-line);
+  color: var(--text-muted);
+}
+.postureRow:hover {
+  background: var(--surface-inset);
+}
+
+.postureName {
+  font-family: var(--font-display);
+  font-size: 12px;
+  flex: none;
+  color: var(--text);
+}
+
+.postureReason {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.postureSince {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  flex: none;
+}

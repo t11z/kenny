@@ -207,3 +207,38 @@ def test_today_scopes_a_user_to_their_own_hosts(tmp_path) -> None:
 
         kpi_hosts = {m["agent_id"] for k in body["kpis"] for m in k["members"]}
         assert "bob-pc" not in kpi_hosts
+
+
+_POSTURE_SNAPSHOT = {
+    "encryption": {"status": "ok", "summary": "", "volumes": [{"mount": "C:", "protection_status": 0}]},
+}
+
+
+def test_today_ranks_newest_incident_first_and_counts_posture(tmp_path) -> None:
+    """Joined across the store, alert_state and the ranking: two crit hosts
+    order newest-first by the age the alert loop recorded, and a posture-only
+    host contributes to `posture_count`, never to `items`."""
+
+    app = build_app(db_path=str(tmp_path / "today_age.sqlite"))
+    now = datetime.now(timezone.utc)
+    with TestClient(app) as c:
+        h = _bearer(app)
+        store, state = app.state.store, app.state.alert_state
+        at = (now - timedelta(minutes=5)).isoformat()
+        c.portal.call(partial(store.insert, "old-crit", at, _CRIT_SNAPSHOT))
+        c.portal.call(partial(store.insert, "new-crit", at, _CRIT_SNAPSHOT))
+        c.portal.call(partial(store.insert, "posture-pc", at, _POSTURE_SNAPSHOT))
+        c.portal.call(partial(state.upsert, "old-crit", "section:disk", status="crit",
+                              since=(now - timedelta(days=3)).isoformat(), last_notified_at=None))
+        c.portal.call(partial(state.upsert, "new-crit", "section:disk", status="crit",
+                              since=(now - timedelta(hours=1)).isoformat(), last_notified_at=None))
+
+        body = c.get("/api/today", headers=h).json()
+        assert [i["host"] for i in body["items"]] == ["new-crit", "old-crit"]
+        assert body["items"][0]["age_seconds"] < body["items"][1]["age_seconds"]
+        assert body["items"][0]["since"] is not None
+        assert body["posture_count"] == 1
+        assert body["posture_line"] == "1 posture finding unchanged"
+        # A posture-only host is a quiet host in the verdict and the donut.
+        assert "One machine needs attention" not in body["verdict_sentence"]
+        assert {s["key"]: s["value"] for s in body["donut"]["segments"]} == {"crit": 2, "ok": 1}
