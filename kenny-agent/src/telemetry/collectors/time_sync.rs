@@ -10,11 +10,8 @@
 
 use serde_json::json;
 
-use crate::telemetry::Section;
-// The Windows path routes through `core`/`windows_impl`, which import `Status`
-// themselves; the portable stub and the Linux arm name it at this level.
-#[cfg(not(windows))]
 use crate::protocol::Status;
+use crate::telemetry::Section;
 
 /// Collect the `time_sync` section.
 pub fn collect() -> Section {
