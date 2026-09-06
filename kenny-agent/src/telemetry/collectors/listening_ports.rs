@@ -244,13 +244,24 @@ mod linux_impl {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     /// Decode a hex string into its raw bytes (even length required).
+    ///
+    /// Works on raw bytes rather than `str` byte-index slicing: `local_address` comes
+    /// from `/proc/net/{tcp,udp}[6]`, which `read_to_string` only guarantees is valid
+    /// UTF-8, not ASCII. A multi-byte character at an even string-length offset (e.g.
+    /// "€0:0016") would make `&hex[i..i + 2]` slice through the middle of that
+    /// character and panic; per-byte hex-digit decoding can't hit a char boundary.
     fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
-        if !hex.len().is_multiple_of(2) {
+        let bytes = hex.as_bytes();
+        if !bytes.len().is_multiple_of(2) {
             return None;
         }
-        (0..hex.len())
+        (0..bytes.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .map(|i| {
+                let hi = (bytes[i] as char).to_digit(16)?;
+                let lo = (bytes[i + 1] as char).to_digit(16)?;
+                Some((hi * 16 + lo) as u8)
+            })
             .collect()
     }
 
@@ -389,6 +400,23 @@ mod linux_impl {
             assert_eq!(ports[0].proto, "udp");
             assert_eq!(ports[0].port, 0x35);
             assert_eq!(ports[0].address, "127.0.0.1");
+        }
+
+        #[test]
+        fn parse_proc_net_does_not_panic_on_non_ascii_local_address() {
+            // `read_to_string` only guarantees valid UTF-8, not ASCII. A multi-byte
+            // char in `local_address` used to panic `hex_bytes`'s byte-index slicing
+            // (e.g. "€0:0016" is an even *string* length but not char-boundary safe
+            // at every even byte offset).
+            let tcp = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: \u{20AC}0:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000 100
+";
+            let ports = parse_proc_net(tcp, "tcp", false);
+            assert!(
+                ports.is_empty(),
+                "malformed address decodes to nothing, not a panic"
+            );
         }
     }
 }
